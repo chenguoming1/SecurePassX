@@ -68,7 +68,9 @@ export default function VaultDashboard({
   const [editingCred, setEditingCred] = useState<Partial<DecryptedCredential> | null>(null);
   const [showFormModal, setShowFormModal] = useState(false);
   const [formPassVisible, setFormPassVisible] = useState(false);
+  const [formNotesVisible, setFormNotesVisible] = useState(false);
   const [detailPassVisible, setDetailPassVisible] = useState(false);
+  const [detailNotesVisible, setDetailNotesVisible] = useState(false);
 
   // Active password generator modal / drawer
   const [showGeneratorModal, setShowGeneratorModal] = useState(false);
@@ -259,7 +261,15 @@ export default function VaultDashboard({
 
   useEffect(() => {
     setDetailPassVisible(false);
+    setDetailNotesVisible(false);
   }, [selectedCred]);
+
+  useEffect(() => {
+    if (!showFormModal) {
+      setFormPassVisible(false);
+      setFormNotesVisible(false);
+    }
+  }, [showFormModal]);
 
   // 3. Search and filter credentials on category or query update
   useEffect(() => {
@@ -1155,11 +1165,25 @@ export default function VaultDashboard({
 
                     {selectedCred.notes && (
                         <div>
-                          <span className="block text-[10px] font-mono font-bold text-slate-500 uppercase tracking-wider mb-1 ml-1">
-                            Notes
-                          </span>
+                          <div className="flex justify-between items-center mb-1 ml-1">
+                            <span className="block text-[10px] font-mono font-bold text-slate-500 uppercase tracking-wider">
+                              Notes
+                            </span>
+                            <button
+                                type="button"
+                                onClick={() => {
+                                  if (!detailNotesVisible) {
+                                    logAuditEntry("view_notes", selectedCred.title);
+                                  }
+                                  setDetailNotesVisible(!detailNotesVisible);
+                                }}
+                                className="px-1.5 py-0.5 text-[10px] font-sans font-bold hover:text-white text-slate-500 cursor-pointer select-none"
+                            >
+                              {detailNotesVisible ? "Hide" : "Show"}
+                            </button>
+                          </div>
                           <div className="bg-[#020617] border border-slate-850 rounded-xl p-3 text-xs text-slate-300 select-text whitespace-pre-wrap max-h-32 overflow-y-auto text-left">
-                            {selectedCred.notes}
+                            {detailNotesVisible ? selectedCred.notes : "••••••••••••••••"}
                           </div>
                         </div>
                     )}
@@ -1305,15 +1329,25 @@ export default function VaultDashboard({
                     </div>
 
                     <div>
-                      <label className="block text-[10px] font-mono font-bold uppercase tracking-wider text-slate-400 mb-1 ml-1">
-                        Notes
-                      </label>
+                      <div className="flex justify-between items-center mb-1 ml-1">
+                        <label className="block text-[10px] font-mono font-bold uppercase tracking-wider text-slate-400">
+                          Notes
+                        </label>
+                        <button
+                            type="button"
+                            onClick={() => setFormNotesVisible(!formNotesVisible)}
+                            className="px-1.5 py-0.5 text-[10px] font-sans font-bold hover:text-white text-slate-500 cursor-pointer select-none"
+                        >
+                          {formNotesVisible ? "Hide" : "Show"}
+                        </button>
+                      </div>
                       <textarea
                           value={editingCred.notes || ""}
                           onChange={(e) => setEditingCred({ ...editingCred, notes: e.target.value })}
                           placeholder="Backup PIN, SSH Key coordinates..."
                           rows={3}
-                          className="w-full bento-input py-2.5 px-3.5 text-xs text-slate-300 placeholder-slate-705 placeholder-slate-700 font-sans resize-none"
+                          style={{ WebkitTextSecurity: formNotesVisible ? "none" : "disc" }}
+                          className="w-full bento-input py-2.5 px-3.5 text-xs text-slate-300 placeholder-slate-700 font-sans resize-none"
                       />
                     </div>
 
