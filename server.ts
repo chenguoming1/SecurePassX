@@ -9,6 +9,7 @@ import crypto from "crypto";
 import sqlite3 from "sqlite3";
 import { open, Database } from "sqlite";
 import { createServer as createViteServer } from "vite";
+import fs from "fs";
 
 interface AuthenticatedRequest extends Request {
   userId?: number;
@@ -95,8 +96,14 @@ async function startServer() {
   const PORT = 3000;
 
   // Initialize SQLite securely
+  const dbPath = process.env.DB_PATH || "./securepassx.db";
+  const dbDir = path.dirname(dbPath);
+  if (!fs.existsSync(dbDir)) {
+    fs.mkdirSync(dbDir, { recursive: true });
+  }
+
   const db = await open({
-    filename: "./securepassx.db",
+    filename: dbPath,
     driver: sqlite3.Database,
   });
 

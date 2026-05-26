@@ -11,8 +11,9 @@ services:
     environment:
       - NODE_ENV=production
       - DB_ENCRYPTION_KEY="custom_production_key_must_be_32_characters_for_secure_sqlite"
+      - DB_PATH=/app/data/securepassx.db
     volumes:
-      - securepassx_storage:/app
+      - securepassx_storage:/app/data
     restart: unless-stopped
 
 volumes:
