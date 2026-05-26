@@ -1,0 +1,6 @@
+{
+  "name": "SecurePassX",
+  "description": "End-to-end encrypted password manager with client-side cryptography, optional biometric authentication, and an encrypted SQLite database support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

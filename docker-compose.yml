@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  securepassx:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: securepassx_vault
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - DB_ENCRYPTION_KEY="custom_production_key_must_be_32_characters_for_secure_sqlite"
+    volumes:
+      - securepassx_storage:/app
+    restart: unless-stopped
+
+volumes:
+  securepassx_storage:
+    driver: local

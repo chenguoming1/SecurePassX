@@ -1,0 +1,61 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Space Grotesk", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer utilities {
+  .bento-card {
+    background-color: #0f172a;
+    border: 1px solid #1e293b;
+    border-radius: 1.5rem;
+    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  
+  .bento-card:hover {
+    border-color: #334155;
+    transform: translateY(-2px);
+    box-shadow: 0 12px 30px -10px rgba(0, 0, 0, 0.4);
+  }
+
+  .bento-input {
+    background-color: #020617;
+    border: 1px solid #1e293b;
+    border-radius: 0.85rem;
+    font-family: var(--font-sans);
+    outline: none;
+    transition: all 0.2s ease-in-out;
+  }
+  
+  .bento-input:focus {
+    border-color: #10b981;
+    box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.15);
+  }
+  
+  .bento-btn-emerald {
+    background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+    border-radius: 1rem;
+    font-weight: 600;
+    transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  
+  .bento-btn-emerald:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 8px 20px -6px rgba(16, 185, 129, 0.4);
+  }
+  
+  .bento-btn-secondary {
+    background-color: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 1rem;
+    transition: all 0.2s ease;
+  }
+  
+  .bento-btn-secondary:hover {
+    background-color: #334155;
+    border-color: #475569;
+  }
+}
