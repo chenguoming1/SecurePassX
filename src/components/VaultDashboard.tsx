@@ -68,6 +68,7 @@ export default function VaultDashboard({
   const [editingCred, setEditingCred] = useState<Partial<DecryptedCredential> | null>(null);
   const [showFormModal, setShowFormModal] = useState(false);
   const [formPassVisible, setFormPassVisible] = useState(false);
+  const [detailPassVisible, setDetailPassVisible] = useState(false);
 
   // Active password generator modal / drawer
   const [showGeneratorModal, setShowGeneratorModal] = useState(false);
@@ -255,6 +256,10 @@ export default function VaultDashboard({
       generateQuickKey();
     }
   }, [token]);
+
+  useEffect(() => {
+    setDetailPassVisible(false);
+  }, [selectedCred]);
 
   // 3. Search and filter credentials on category or query update
   useEffect(() => {
@@ -1055,7 +1060,7 @@ export default function VaultDashboard({
                   <div className="flex justify-between items-start border-b border-slate-800 pb-3 mb-4">
                     <div>
                       <span className="text-[10px] font-mono uppercase font-bold text-slate-500 tracking-wider">
-                        Decrypted Vault Item
+                        Website / Service Details
                       </span>
                       <h3 className="font-display font-bold text-xl text-white mt-0.5">
                         {selectedCred.title}
@@ -1073,7 +1078,7 @@ export default function VaultDashboard({
                     {selectedCred.username && (
                         <div>
                           <span className="block text-[10px] font-mono font-bold text-slate-500 uppercase tracking-wider mb-1 ml-1">
-                            Username / Sign-In Identifier
+                            Username
                           </span>
                           <div className="relative flex items-center bg-[#020617] border border-slate-850 rounded-xl p-3 font-mono text-emerald-400 select-all pr-12 text-xs">
                             <span className="truncate">{selectedCred.username}</span>
@@ -1093,30 +1098,46 @@ export default function VaultDashboard({
 
                     <div>
                       <span className="block text-[10px] font-mono font-bold text-slate-500 uppercase tracking-wider mb-1 ml-1">
-                        Symmetric Decrypted Key
+                        Password
                       </span>
-                      <div className="relative flex items-center bg-[#020617] border border-slate-850 rounded-xl p-3 font-mono text-emerald-400 select-all pr-12 text-xs">
-                        <span className="truncate font-semibold select-text">{selectedCred.password}</span>
-                        <button
-                            onClick={() => {
-                              logAuditEntry("view_password", selectedCred.title);
-                              handleCopyToClipboard(selectedCred.id, selectedCred.password, "password", selectedCred.title);
-                            }}
-                            className="absolute right-2.5 p-1.5 text-slate-500 hover:text-white transition-colors cursor-pointer"
-                        >
-                          {clipboardFeedback?.id === selectedCred.id && clipboardFeedback?.field === "password" ? (
-                              <Check className="w-4 h-4 text-emerald-500" />
-                          ) : (
-                              <Clipboard className="w-4 h-4" />
-                          )}
-                        </button>
+                      <div className="relative flex items-center bg-[#020617] border border-slate-850 rounded-xl p-3 font-mono text-emerald-400 select-all pr-20 text-xs">
+                        <span className="truncate font-semibold select-text">
+                          {detailPassVisible ? selectedCred.password : "••••••••••••"}
+                        </span>
+                        <div className="absolute right-2.5 flex items-center gap-1">
+                          <button
+                              type="button"
+                              onClick={() => {
+                                if (!detailPassVisible) {
+                                  logAuditEntry("view_password", selectedCred.title);
+                                }
+                                setDetailPassVisible(!detailPassVisible);
+                              }}
+                              className="px-1.5 py-1 text-[10px] font-sans font-bold hover:text-white text-slate-500 cursor-pointer select-none"
+                          >
+                            {detailPassVisible ? "Hide" : "Show"}
+                          </button>
+                          <button
+                              onClick={() => {
+                                handleCopyToClipboard(selectedCred.id, selectedCred.password, "password", selectedCred.title);
+                              }}
+                              className="p-1 text-slate-500 hover:text-white transition-colors cursor-pointer"
+                              title="Copy password"
+                          >
+                            {clipboardFeedback?.id === selectedCred.id && clipboardFeedback?.field === "password" ? (
+                                <Check className="w-4 h-4 text-emerald-500" />
+                            ) : (
+                                <Clipboard className="w-4 h-4" />
+                            )}
+                          </button>
+                        </div>
                       </div>
                     </div>
 
                     {selectedCred.url && (
                         <div>
                           <span className="block text-[10px] font-mono font-bold text-slate-500 uppercase tracking-widest mb-1 ml-1">
-                            Domain URL Link
+                            Website / URL
                           </span>
                           <div className="flex items-center justify-between bg-[#020617] border border-slate-850 rounded-xl p-3 font-mono text-sky-450 text-blue-400 text-xs">
                             <span className="truncate">{selectedCred.url}</span>
@@ -1126,7 +1147,7 @@ export default function VaultDashboard({
                                 rel="noreferrer"
                                 className="text-slate-500 hover:text-slate-200 shrink-0 ml-2"
                             >
-                              <ExternalLink className="w-3.5 h-3.5" />
+                                <ExternalLink className="w-3.5 h-3.5" />
                             </a>
                           </div>
                         </div>
@@ -1135,7 +1156,7 @@ export default function VaultDashboard({
                     {selectedCred.notes && (
                         <div>
                           <span className="block text-[10px] font-mono font-bold text-slate-500 uppercase tracking-wider mb-1 ml-1">
-                            Private Notes
+                            Notes
                           </span>
                           <div className="bg-[#020617] border border-slate-850 rounded-xl p-3 text-xs text-slate-300 select-text whitespace-pre-wrap max-h-32 overflow-y-auto text-left">
                             {selectedCred.notes}
@@ -1203,7 +1224,7 @@ export default function VaultDashboard({
                     <div className="grid grid-cols-2 gap-3.5">
                       <div>
                         <label className="block text-[10px] font-mono font-bold uppercase tracking-wider text-slate-400 mb-1 ml-1">
-                          Platform name (E2EE)
+                          Website / Service Name
                         </label>
                         <input
                             type="text"
@@ -1217,7 +1238,7 @@ export default function VaultDashboard({
 
                       <div>
                         <label className="block text-[10px] font-mono font-bold uppercase tracking-wider text-slate-400 mb-1 ml-1">
-                          Category Type
+                          Category
                         </label>
                         <select
                             value={editingCred.category || "General"}
@@ -1236,7 +1257,7 @@ export default function VaultDashboard({
                     <div className="grid grid-cols-2 gap-3.5">
                       <div>
                         <label className="block text-[10px] font-mono font-bold uppercase tracking-wider text-slate-400 mb-1 ml-1">
-                          Username Identification
+                          Username
                         </label>
                         <input
                             type="text"
@@ -1249,7 +1270,7 @@ export default function VaultDashboard({
 
                       <div>
                         <label className="block text-[10px] font-mono font-bold uppercase tracking-wider text-slate-400 mb-1 ml-1">
-                          Secret Password Key
+                          Password
                         </label>
                         <div className="relative flex items-center">
                           <input
@@ -1272,7 +1293,7 @@ export default function VaultDashboard({
 
                     <div>
                       <label className="block text-[10px] font-mono font-bold uppercase tracking-wider text-slate-400 mb-1 ml-1">
-                        Platform Web Address
+                        Website / URL
                       </label>
                       <input
                           type="text"
@@ -1285,7 +1306,7 @@ export default function VaultDashboard({
 
                     <div>
                       <label className="block text-[10px] font-mono font-bold uppercase tracking-wider text-slate-400 mb-1 ml-1">
-                        Cipher encrypted notations
+                        Notes
                       </label>
                       <textarea
                           value={editingCred.notes || ""}
