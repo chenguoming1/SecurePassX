@@ -21,16 +21,24 @@ import {
   ExternalLink,
   History,
   HardDriveDownload,
+  HardDriveUpload,
   Fingerprint,
   Check,
   Sparkles,
   RefreshCw,
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
-import { encryptString, decryptString, generateSalt } from "../lib/crypto";
+import {
+  encryptString,
+  decryptString,
+  deriveUserKeys,
+  generateSalt,
+  DEFAULT_KDF_ITERATIONS,
+} from "../lib/crypto";
+import { encryptCredentialPayload } from "../lib/vault";
 import { DecryptedCredential, EncryptedCredential, Category, AuditLogEntry } from "../types";
 import PasswordGenerator from "./PasswordGenerator";
-import BiometricPrompt from "./BiometricPrompt";
+import SecurityCenter from "./SecurityCenter";
 
 interface VaultDashboardProps {
   userId: number;
@@ -79,11 +87,9 @@ export default function VaultDashboard({
   const [showLogsModal, setShowLogsModal] = useState(false);
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
 
-  // Biometrics parameters
+  // Biometrics / security center
   const [biometricEnabled, setBiometricEnabled] = useState(initialBiometricEnabled);
-  const [bioPromptOpen, setBioPromptOpen] = useState(false);
-  const [confirmMasterForBio, setConfirmMasterForBio] = useState(false);
-  const [masterConfirmInput, setMasterConfirmInput] = useState("");
+  const [showSecurityCenter, setShowSecurityCenter] = useState(false);
 
   // Quick Key seed generator
   const [localQuickKey, setLocalQuickKey] = useState("xK9#v2_PqL!8mM@z");
@@ -95,6 +101,29 @@ export default function VaultDashboard({
   // Session lockers limits (Inactivity Timeout)
   const [secondsRemaining, setSecondsRemaining] = useState(300); // 5 minutes inactivity timer
   const lastActiveRef = useRef<number>(Date.now());
+
+  // Vault import file picker
+  const importFileRef = useRef<HTMLInputElement>(null);
+
+  // Clipboard hygiene: sensitive copies are wiped after 30s and on lock.
+  const clipboardTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const copyToClipboardSecurely = (text: string) => {
+    navigator.clipboard.writeText(text).catch(() => {});
+    if (clipboardTimerRef.current) clearTimeout(clipboardTimerRef.current);
+    clipboardTimerRef.current = setTimeout(() => {
+      navigator.clipboard.writeText("").catch(() => {});
+      clipboardTimerRef.current = null;
+    }, 30_000);
+  };
+
+  const wipeClipboard = () => {
+    if (clipboardTimerRef.current) {
+      clearTimeout(clipboardTimerRef.current);
+      clipboardTimerRef.current = null;
+      navigator.clipboard.writeText("").catch(() => {});
+    }
+  };
 
   // Category Colors Mapping
   const getCategoryColor = (cat: Category) => {
@@ -118,6 +147,17 @@ export default function VaultDashboard({
     }
   };
 
+  // Lock the session: revoke the server-side token, wipe any sensitive
+  // clipboard content, then drop local state.
+  const handleLockSession = () => {
+    wipeClipboard();
+    fetch("/api/auth/logout", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    }).catch(() => {});
+    onLockSession();
+  };
+
   // 1. Inactivity checking & Session timer
   useEffect(() => {
     const activityTrigger = () => {
@@ -137,7 +177,7 @@ export default function VaultDashboard({
       if (remaining <= 0) {
         clearInterval(timer);
         logAuditEntry("auto-lock", "Inactivity timer threshold reached");
-        onLockSession();
+        handleLockSession();
       }
     }, 1000);
 
@@ -164,16 +204,27 @@ export default function VaultDashboard({
 
       const rawEncryptedList: EncryptedCredential[] = await res.json();
 
-      // Decrypt all rows CLIENT-SIDE (E2E)
+      // Decrypt all rows CLIENT-SIDE (E2E).
+      // New entries carry a per-field IV map (JSON); legacy entries reused a
+      // single IV for every field.
       const decryptedList: DecryptedCredential[] = [];
       for (const item of rawEncryptedList) {
         try {
-          const title = await decryptString(item.title, item.iv, encryptionKey);
-          const usernameVal = item.usernameEnc ? await decryptString(item.usernameEnc, item.iv, encryptionKey) : "";
-          const passwordVal = item.passwordEnc ? await decryptString(item.passwordEnc, item.iv, encryptionKey) : "";
-          const urlVal = item.urlEnc ? await decryptString(item.urlEnc, item.iv, encryptionKey) : "";
-          const notesVal = item.notesEnc ? await decryptString(item.notesEnc, item.iv, encryptionKey) : "";
-          const categoryVal = item.category ? await decryptString(item.category, item.iv, encryptionKey) : "General";
+          let ivMap: Record<string, string> | null = null;
+          if (item.iv && item.iv.startsWith("{")) {
+            try {
+              ivMap = JSON.parse(item.iv);
+            } catch {
+              ivMap = null;
+            }
+          }
+
+          const title = await decryptString(item.title, ivMap?.t ?? item.iv, encryptionKey);
+          const usernameVal = item.usernameEnc ? await decryptString(item.usernameEnc, ivMap?.u ?? item.iv, encryptionKey) : "";
+          const passwordVal = item.passwordEnc ? await decryptString(item.passwordEnc, ivMap?.p ?? item.iv, encryptionKey) : "";
+          const urlVal = item.urlEnc ? await decryptString(item.urlEnc, ivMap?.r ?? item.iv, encryptionKey) : "";
+          const notesVal = item.notesEnc ? await decryptString(item.notesEnc, ivMap?.n ?? item.iv, encryptionKey) : "";
+          const categoryVal = item.category ? await decryptString(item.category, ivMap?.c ?? item.iv, encryptionKey) : "General";
 
           decryptedList.push({
             id: item.id,
@@ -199,16 +250,18 @@ export default function VaultDashboard({
     }
   };
 
-  // Helper audit logger to host
+  // Helper audit logger to host. Item names are E2E encrypted before leaving
+  // the client so the server never learns which entries were touched.
   const logAuditEntry = async (action: string, itemName: string) => {
     try {
+      const { cipherText: itemNameEnc, iv } = await encryptString(itemName, encryptionKey);
       await fetch("/api/audits", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ action, itemName }),
+        body: JSON.stringify({ action, itemNameEnc, iv }),
       });
       refreshAuditLogs();
     } catch (err) {
@@ -223,7 +276,19 @@ export default function VaultDashboard({
       });
       if (res.ok) {
         const data = await res.json();
-        setAuditLogs(data);
+        const decrypted: AuditLogEntry[] = [];
+        for (const log of data) {
+          let itemName = log.itemNameEnc || "";
+          if (log.iv) {
+            try {
+              itemName = await decryptString(log.itemNameEnc, log.iv, encryptionKey);
+            } catch {
+              itemName = "[unreadable]";
+            }
+          }
+          decrypted.push({ id: log.id, action: log.action, itemName, timestamp: log.timestamp, e2ee: !!log.iv });
+        }
+        setAuditLogs(decrypted);
       }
     } catch (err) {
       console.error("Failed to sync audit logs stream:", err);
@@ -245,7 +310,7 @@ export default function VaultDashboard({
   };
 
   const handleCopyQuickKey = (keyText: string) => {
-    navigator.clipboard.writeText(keyText);
+    copyToClipboardSecurely(keyText);
     setQuickKeyCopied(true);
     setTimeout(() => setQuickKeyCopied(false), 1500);
     logAuditEntry("copy_password", "Quick Generated Key");
@@ -336,55 +401,21 @@ export default function VaultDashboard({
 
     try {
       const itemTitle = editingCred.title.trim();
-      const itemUser = editingCred.username || "";
-      const itemPass = editingCred.password || "";
-      const itemUrl = editingCred.url || "";
-      const itemNotes = editingCred.notes || "";
-      const itemCat = editingCred.category || "General";
       const itemId = editingCred.id || crypto.randomUUID();
-
       const isNew = !editingCred.id;
-      const { cipherText: titleEnc, iv: titleIv } = await encryptString(itemTitle, encryptionKey);
 
-      // Use the SAME IV for all columns of this entry for easy mapping and clean transmission
-      const ivBuffer = window.atob(titleIv);
-      const ivUint8 = new Uint8Array(ivBuffer.length);
-      for (let i = 0; i < ivBuffer.length; i++) {
-        ivUint8[i] = ivBuffer.charCodeAt(i);
-      }
-
-      const encryptWithIv = async (text: string) => {
-        const encoder = new TextEncoder();
-        const encrypted = await window.crypto.subtle.encrypt(
-            { name: "AES-GCM", iv: ivUint8 },
-            encryptionKey,
-            encoder.encode(text)
-        );
-        const bytes = new Uint8Array(encrypted);
-        let binary = "";
-        for (let i = 0; i < bytes.byteLength; i++) {
-          binary += String.fromCharCode(bytes[i]);
-        }
-        return window.btoa(binary);
-      };
-
-      const userEnc = await encryptWithIv(itemUser);
-      const passEnc = await encryptWithIv(itemPass);
-      const urlEnc = await encryptWithIv(itemUrl);
-      const notesEnc = await encryptWithIv(itemNotes);
-      const catEnc = await encryptWithIv(itemCat);
-
-      const bodyPayload = {
-        id: itemId,
-        title: titleEnc,
-        usernameEnc: userEnc,
-        passwordEnc: passEnc,
-        urlEnc,
-        notesEnc,
-        category: catEnc,
-        iv: titleIv,
-        modifiedAt: Date.now(),
-      };
+      const bodyPayload = await encryptCredentialPayload(
+        {
+          id: itemId,
+          title: itemTitle,
+          username: editingCred.username || "",
+          password: editingCred.password || "",
+          url: editingCred.url || "",
+          notes: editingCred.notes || "",
+          category: editingCred.category || "General",
+        },
+        encryptionKey
+      );
 
       const endpoint = isNew ? "/api/credentials" : `/api/credentials/${itemId}`;
       const method = isNew ? "POST" : "PUT";
@@ -454,7 +485,7 @@ export default function VaultDashboard({
   // Copy helper with timer feeds
   const handleCopyToClipboard = (id: string, text: string, field: "username" | "password" | "copied", title: string) => {
     if (!text) return;
-    navigator.clipboard.writeText(text);
+    copyToClipboardSecurely(text);
     setClipboardFeedback({ id, field });
     logAuditEntry(`copy_${field}`, title);
     setTimeout(() => setClipboardFeedback(null), 1500);
@@ -481,186 +512,168 @@ export default function VaultDashboard({
   // Calculated DB Size
   const dbSizeKB = credentials.length > 0 ? (credentials.length * 1.8 + 4.2).toFixed(1) : "4.0";
 
-  // Export functions
-  const handleExportVault = (encryptionMode: "decrypted" | "encrypted") => {
+  // Trigger a JSON file download
+  const downloadJsonFile = (fileContent: string, fileName: string) => {
+    const blob = new Blob([fileContent], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = fileName;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  // Export: standalone, portable encrypted bundle. A fresh PBKDF2 key is
+  // derived from a passphrase you choose, so the file can be restored into
+  // ANY account (including after a reset).
+  const handleExportVault = async () => {
     try {
       if (credentials.length === 0) {
         alert("Empty vault. Nothing to export.");
         return;
       }
 
-      let fileContent = "";
-      let fileName = "";
+      const exportableCreds = credentials.map((c) => ({
+        id: c.id,
+        title: c.title,
+        username: c.username,
+        password: c.password,
+        url: c.url,
+        notes: c.notes,
+        category: c.category,
+      }));
 
-      if (encryptionMode === "decrypted") {
-        if (!confirm("Caution: Exporting decrypted data output will write clear plaintext passwords into your local file system. Proceed?")) {
-          return;
-        }
-        fileContent = JSON.stringify(credentials, null, 2);
-        fileName = `securepassx-unencrypted-${username}-${Date.now()}.json`;
-        logAuditEntry("export_decrypted", "Decrypted JSON file generated");
-      } else {
-        alert("Creating an export encrypted with your active Master Password...");
-        const backupBundle = {
-          exportDate: Date.now(),
-          owner: username,
-          exportSchema: "SecurePassX-v1.0",
-          credentials: credentials.map((c) => ({
-            id: c.id,
-            title: c.title,
-            username: c.username,
-            password: c.password,
-            url: c.url,
-            notes: c.notes,
-            category: c.category,
-          })),
-        };
-        fileContent = JSON.stringify(backupBundle, null, 2);
-        fileName = `securepassx-encrypted-${username}-${Date.now()}.json`;
-        logAuditEntry("export_encrypted", "Master backup E2EE JSON package generated");
+      const passphrase = prompt(
+        "Choose a passphrase to encrypt this backup (min 8 characters).\n" +
+          "You will need it to import the backup later - it is NOT recoverable."
+      );
+      if (passphrase === null) return;
+      if (passphrase.length < 8) {
+        alert("Backup passphrase must be at least 8 characters.");
+        return;
       }
 
-      const blob = new Blob([fileContent], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = fileName;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(url);
-    } catch (err) {
-      alert("Export failed: " + err);
-    }
-  };
+      setSyncing(true);
+      const kdfSalt = generateSalt();
+      const { encryptionKey: backupKey } = await deriveUserKeys(passphrase, kdfSalt, DEFAULT_KDF_ITERATIONS);
+      const { cipherText, iv } = await encryptString(JSON.stringify(exportableCreds), backupKey);
 
-  // Biometrics configurations
-  const handleRegisterBiometrics = async (credentialId: string, signature: string) => {
-    setBioPromptOpen(false);
-    setSyncing(true);
-
-    try {
-      const res = await fetch("/api/auth/biometric/register", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          credentialId,
-          publicKey: signature,
-        }),
-      });
-
-      if (!res.ok) {
-        throw new Error("Local databases failed to map Touch ID registry.");
-      }
-
-      const bioSalt = generateSalt();
-      const bioKey = await window.crypto.subtle.importKey(
-          "raw",
-          new TextEncoder().encode(signature),
-          { name: "PBKDF2" },
-          false,
-          ["deriveKey"]
-      )
-          .then((baseKey) =>
-              window.crypto.subtle.deriveKey(
-                  {
-                    name: "PBKDF2",
-                    salt: new TextEncoder().encode(bioSalt),
-                    iterations: 100000,
-                    hash: "SHA-256",
-                  },
-                  baseKey,
-                  { name: "AES-GCM", length: 256 },
-                  false,
-                  ["encrypt"]
-              )
-          );
-
-      const encoder = new TextEncoder();
-      const rawData = encoder.encode(masterConfirmInput);
-      const bioIv = window.crypto.getRandomValues(new Uint8Array(12));
-
-      const encryptedBuffer = await window.crypto.subtle.encrypt(
-          { name: "AES-GCM", iv: bioIv },
-          bioKey,
-          rawData
-      );
-
-      const cipherPassword = window.btoa(
-          Array.from(new Uint8Array(encryptedBuffer))
-              .map((b) => String.fromCharCode(b))
-              .join("")
-      );
-
-      const ivBase64 = window.btoa(
-          Array.from(bioIv)
-              .map((b) => String.fromCharCode(b))
-              .join("")
-      );
-
-      const storageObj = {
-        salt: bioSalt,
-        iv: ivBase64,
-        cipherPassword,
+      const backupBundle = {
+        schema: "SecurePassX-Backup-v2",
+        exportDate: Date.now(),
+        owner: username,
+        kdf: { algo: "PBKDF2-SHA256", iterations: DEFAULT_KDF_ITERATIONS, salt: kdfSalt },
+        cipher: "AES-256-GCM",
+        iv,
+        data: cipherText,
       };
 
-      localStorage.setItem(`securepassx-bio-meta-${username.toLowerCase()}`, JSON.stringify(storageObj));
-
-      setBiometricEnabled(true);
-      setSuccessMessage("Device Biometric Touch ID / Face ID mapping successful!");
-      logAuditEntry("setup_biometrics", "WebAuthn signature bindings configured");
-    } catch (err: any) {
-      setErrorMessage(err.message || "Failed to configure biometric encryption.");
+      downloadJsonFile(
+        JSON.stringify(backupBundle, null, 2),
+        `securepassx-encrypted-${username}-${Date.now()}.json`
+      );
+      setSuccessMessage("Encrypted backup exported. Keep the passphrase safe!");
+      logAuditEntry("export_encrypted", "AES-256-GCM encrypted backup generated");
+    } catch (err) {
+      alert("Export failed: " + err);
     } finally {
       setSyncing(false);
-      setMasterConfirmInput("");
-      setConfirmMasterForBio(false);
     }
   };
 
-  const handleVerifyMasterForBio = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!masterConfirmInput) return;
-
-    setSyncing(true);
+  // Import: accepts v2 encrypted bundles and legacy plaintext exports.
+  // Entries whose id already exists in the vault are skipped (idempotent
+  // restore); everything is re-encrypted E2EE with the CURRENT vault key.
+  const handleImportVault = async (file: File) => {
     setErrorMessage("");
+    setSyncing(true);
 
     try {
-      const saltRes = await fetch("/api/auth/salt", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username }),
-      });
+      const text = await file.text();
+      const parsed = JSON.parse(text);
 
-      if (!saltRes.ok) {
-        throw new Error("Unable to authenticate master salt.");
+      let importedCreds: any[];
+
+      if (parsed?.schema === "SecurePassX-Backup-v2") {
+        const passphrase = prompt("Enter the passphrase this backup was encrypted with:");
+        if (passphrase === null) {
+          setSyncing(false);
+          return;
+        }
+        const { encryptionKey: backupKey } = await deriveUserKeys(
+          passphrase,
+          parsed.kdf.salt,
+          parsed.kdf.iterations || DEFAULT_KDF_ITERATIONS
+        );
+        let plaintext: string;
+        try {
+          plaintext = await decryptString(parsed.data, parsed.iv, backupKey);
+        } catch {
+          throw new Error("Could not decrypt backup. Wrong passphrase or corrupted file.");
+        }
+        importedCreds = JSON.parse(plaintext);
+      } else if (Array.isArray(parsed)) {
+        // Legacy plaintext export (bare credentials array)
+        importedCreds = parsed;
+      } else if (Array.isArray(parsed?.credentials)) {
+        // Legacy "encrypted" v1 export (actually plaintext bundle)
+        importedCreds = parsed.credentials;
+      } else {
+        throw new Error("Unrecognized backup file format.");
       }
 
-      const { salt } = await saltRes.json();
-      const loginRes = await fetch("/api/auth/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          username,
-          authKeyHex: masterConfirmInput,
-        }),
-      });
+      const existingIds = new Set(credentials.map((c) => c.id));
+      let imported = 0;
+      let skipped = 0;
 
-      if (!loginRes.ok) {
-        throw new Error("Invalid password verification.");
+      for (const cred of importedCreds) {
+        if (!cred?.title) {
+          skipped++;
+          continue;
+        }
+        if (cred.id && existingIds.has(cred.id)) {
+          skipped++;
+          continue;
+        }
+
+        const payload = await encryptCredentialPayload(
+          {
+            id: cred.id || crypto.randomUUID(),
+            title: String(cred.title),
+            username: String(cred.username || ""),
+            password: String(cred.password || ""),
+            url: String(cred.url || ""),
+            notes: String(cred.notes || ""),
+            category: String(cred.category || "General"),
+          },
+          encryptionKey
+        );
+
+        const res = await fetch("/api/credentials", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(payload),
+        });
+
+        if (res.ok) imported++;
+        else skipped++;
       }
 
-      setConfirmMasterForBio(false);
-      setBioPromptOpen(true);
-    } catch (err) {
-      setErrorMessage("Passphrase confirmation failed. Unable to map biometrics.");
+      await loadVaultCredentials();
+      setSuccessMessage(`Import complete: ${imported} added, ${skipped} skipped (duplicates/invalid).`);
+      logAuditEntry("import_vault", `Imported ${imported} entries from backup file`);
+    } catch (err: any) {
+      setErrorMessage(err.message || "Import failed. File could not be processed.");
     } finally {
       setSyncing(false);
     }
   };
+
 
   return (
       <div className="min-h-screen bg-[#020617] text-slate-100 font-sans antialiased relative px-4 py-6 md:p-8 select-none">
@@ -717,7 +730,7 @@ export default function VaultDashboard({
                   {username.substring(0, 2).toUpperCase()}
                 </div>
                 <button
-                    onClick={onLockSession}
+                    onClick={handleLockSession}
                     className="p-2 bg-slate-900 hover:bg-rose-500/10 border border-slate-800 hover:border-rose-500/20 text-slate-400 hover:text-rose-400 rounded-xl transition-all cursor-pointer"
                     title="Lock session"
                 >
@@ -929,11 +942,9 @@ export default function VaultDashboard({
               {/* CARD 3: BIOMETRIC AUTH CONFIG */}
               <div
                   onClick={() => {
-                    if (!biometricEnabled) {
-                      setConfirmMasterForBio(true);
-                      setSuccessMessage("");
-                      setErrorMessage("");
-                    }
+                    setShowSecurityCenter(true);
+                    setSuccessMessage("");
+                    setErrorMessage("");
                   }}
                   className="bento-card p-5 flex flex-col justify-between group cursor-pointer relative min-h-[160px] text-left"
               >
@@ -952,11 +963,11 @@ export default function VaultDashboard({
                 </div>
 
                 <div className="mt-3">
-                  <h3 className="text-sm font-bold text-white font-display">Biometric Auth</h3>
+                  <h3 className="text-sm font-bold text-white font-display">Security Center</h3>
                   <p className="text-xs text-slate-500 mt-1">
                     {biometricEnabled
-                        ? "WebAuthn key active. Touch ID & Face ID instant bypass configured."
-                        : "Configure TouchID or local Face ID signatures to unlock device instantly."}
+                        ? "Manage passkeys, two-factor authentication, and master password rotation."
+                        : "Set up Touch ID / Face ID passkeys, 2FA, or change your master password."}
                   </p>
                 </div>
               </div>
@@ -1039,19 +1050,33 @@ export default function VaultDashboard({
             <div className="text-slate-500 text-left">
               SecurePassX zero knowledge. Keep physically printed backups or master sheets.
             </div>
-            <div className="flex gap-2">
+            <div className="flex gap-2 flex-wrap">
+              <input
+                  type="file"
+                  accept="application/json,.json"
+                  ref={importFileRef}
+                  className="hidden"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) handleImportVault(file);
+                    e.target.value = "";
+                  }}
+              />
               <button
-                  onClick={() => handleExportVault("encrypted")}
-                  className="px-3.5 py-2.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-xl font-semibold text-slate-300 hover:text-white flex items-center gap-1.5 transition-all cursor-pointer"
+                  onClick={() => importFileRef.current?.click()}
+                  disabled={syncing}
+                  className="px-3.5 py-2.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-xl font-semibold text-slate-300 hover:text-white flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50"
+              >
+                <HardDriveUpload className="w-3.5 h-3.5 text-blue-400" />
+                <span>Import Vault</span>
+              </button>
+              <button
+                  onClick={() => handleExportVault()}
+                  disabled={syncing}
+                  className="px-3.5 py-2.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-xl font-semibold text-slate-300 hover:text-white flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50"
               >
                 <HardDriveDownload className="w-3.5 h-3.5 text-emerald-500" />
                 <span>Download Encrypted Backup</span>
-              </button>
-              <button
-                  onClick={() => handleExportVault("decrypted")}
-                  className="px-3.5 py-2.5 bg-slate-900 hover:bg-rose-500/5 border border-slate-800 hover:border-rose-500/15 rounded-xl font-semibold text-slate-400 hover:text-rose-450 transition-all cursor-pointer"
-              >
-                <span>Plain Plaintext Export</span>
               </button>
             </div>
           </footer>
@@ -1397,63 +1422,6 @@ export default function VaultDashboard({
           )}
         </AnimatePresence>
 
-        {/* SECURE BIOMETRICS PASSWORD CHECK POPUP */}
-        <AnimatePresence>
-          {confirmMasterForBio && (
-              <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
-                <motion.div
-                    initial={{ opacity: 0, scale: 0.95 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    exit={{ opacity: 0, scale: 0.95 }}
-                    className="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl p-6 text-slate-100"
-                >
-                  <h3 className="font-display font-bold text-base text-white text-center">
-                    Enable WebAuthn biometric mapping
-                  </h3>
-                  <p className="font-sans text-xs text-slate-400 mt-2 text-center leading-relaxed">
-                    Verify clear master vault password coordinates to safely map Face ID / Touch ID signatures.
-                  </p>
-
-                  <form onSubmit={handleVerifyMasterForBio} className="space-y-4 mt-4 text-left">
-                    <div>
-                      <label className="block text-[10px] font-mono font-bold uppercase tracking-wider text-slate-400 mb-1 ml-1">
-                        Master Password Phrase
-                      </label>
-                      <input
-                          type="password"
-                          required
-                          value={masterConfirmInput}
-                          onChange={(e) => setMasterConfirmInput(e.target.value)}
-                          placeholder="Confirm Master password"
-                          className="w-full bento-input py-2.5 px-3.5 text-xs text-white placeholder-slate-75 * placeholder-slate-700 font-sans"
-                      />
-                    </div>
-
-                    <div className="flex gap-2.5 pt-2">
-                      <button
-                          type="button"
-                          onClick={() => {
-                            setConfirmMasterForBio(false);
-                            setMasterConfirmInput("");
-                          }}
-                          className="flex-1 py-2 bg-slate-800 hover:bg-slate-750 text-slate-300 rounded-xl font-semibold font-sans text-xs cursor-pointer border border-slate-700"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                          type="submit"
-                          disabled={syncing}
-                          className="flex-1 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold font-sans text-xs rounded-xl cursor-pointer shadow-md"
-                      >
-                        Confirm Password
-                      </button>
-                    </div>
-                  </form>
-                </motion.div>
-              </div>
-          )}
-        </AnimatePresence>
-
         {/* SECURITY AUDIT STREAMING MODAL */}
         <AnimatePresence>
           {showLogsModal && (
@@ -1552,13 +1520,18 @@ export default function VaultDashboard({
           )}
         </AnimatePresence>
 
-        {/* HIGH-FIDELITY BIOMETRICS WEB_AUTHN PROMPTS */}
-        <BiometricPrompt
-            isOpen={bioPromptOpen}
-            onClose={() => setBioPromptOpen(false)}
+        {/* SECURITY CENTER: passkeys, 2FA, master password rotation */}
+        <SecurityCenter
+            isOpen={showSecurityCenter}
+            onClose={() => setShowSecurityCenter(false)}
+            token={token}
             username={username}
-            mode="register"
-            onSuccess={handleRegisterBiometrics}
+            encryptionKey={encryptionKey}
+            credentials={credentials}
+            auditLogs={auditLogs}
+            onBiometricChanged={setBiometricEnabled}
+            onPasswordChanged={handleLockSession}
+            onAudit={logAuditEntry}
         />
       </div>
   );

@@ -57,7 +57,9 @@ export interface PasswordPolicy {
 
 export interface AuditLogEntry {
   id: string;
-  action: string; // 'create' | 'update' | 'delete' | 'view_password' | 'export'
+  action: string; // 'create' | 'update' | 'delete' | 'view_password' | 'export' | auth events
   itemName: string;
   timestamp: number;
+  /** True when itemName was E2E encrypted by this client (vs server-generated auth events). */
+  e2ee?: boolean;
 }

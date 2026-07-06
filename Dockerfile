@@ -14,8 +14,10 @@ RUN npm install
 COPY . .
 
 # Expose production environment parameters
+# NOTE: DB_ENCRYPTION_KEY is intentionally NOT baked into the image.
+# Provide it at runtime (docker-compose .env / secrets), or the server will
+# generate and persist a random key in the data volume.
 ENV NODE_ENV=production
-ENV DB_ENCRYPTION_KEY="production_default_secured_salt_change_this"
 
 # Build static assets & compile TypeScript express handler bundle
 RUN npm run build

@@ -6,8 +6,15 @@
 import React, { useState } from "react";
 import { KeyRound, ShieldAlert, Fingerprint, RefreshCw, UserCheck, ShieldCheck, DatabaseZap } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
-import { deriveUserKeys, generateSalt, hashSHA256 } from "../lib/crypto";
-import BiometricPrompt from "./BiometricPrompt";
+import {
+  deriveUserKeys,
+  generateSalt,
+  hashSHA256,
+  deriveKeyFromPrfSecret,
+  decryptString,
+  DEFAULT_KDF_ITERATIONS,
+} from "../lib/crypto";
+import BiometricPrompt, { BiometricAuthResult } from "./BiometricPrompt";
 
 interface AuthScreenProps {
   onUnlockSuccess: (
@@ -30,6 +37,12 @@ export default function AuthScreen({ onUnlockSuccess }: AuthScreenProps) {
 
   // Biometric login triggers
   const [bioPromptOpen, setBioPromptOpen] = useState(false);
+
+  // TOTP second-factor step. Derived keys from the first (password) attempt
+  // are cached so the code retry skips the expensive KDF.
+  const [totpRequired, setTotpRequired] = useState(false);
+  const [totpCode, setTotpCode] = useState("");
+  const pendingLoginRef = React.useRef<{ encryptionKey: CryptoKey; clientAuthHash: string } | null>(null);
 
   const triggerPostSession = async (userId: number, uName: string, encKey: CryptoKey, token: string, bioEnabled: boolean) => {
     onUnlockSuccess(userId, uName, encKey, token, bioEnabled);
@@ -61,8 +74,8 @@ export default function AuthScreen({ onUnlockSuccess }: AuthScreenProps) {
       // 1. Generate fresh secure salt for KDF
       const salt = generateSalt();
 
-      // 2. Perform PBKDF2 Master Keys derivation
-      const { encryptionKey, authKeyHex } = await deriveUserKeys(password, salt);
+      // 2. Perform PBKDF2 Master Keys derivation (600k iterations)
+      const { encryptionKey, authKeyHex } = await deriveUserKeys(password, salt, DEFAULT_KDF_ITERATIONS);
 
       // 3. Sha256 the authentication key for server validation storage
       const passwordHash = await hashSHA256(authKeyHex);
@@ -75,6 +88,7 @@ export default function AuthScreen({ onUnlockSuccess }: AuthScreenProps) {
           username: username.trim(),
           salt,
           passwordHash,
+          iterations: DEFAULT_KDF_ITERATIONS,
         }),
       });
 
@@ -108,40 +122,63 @@ export default function AuthScreen({ onUnlockSuccess }: AuthScreenProps) {
     setLoading(true);
 
     try {
-      // 1. Retreive server encryption salt for target profile
-      const saltRes = await fetch("/api/auth/salt", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: username.trim() }),
-      });
+      let encryptionKey: CryptoKey;
+      let clientAuthHash: string;
 
-      const saltData = await saltRes.json();
-      if (!saltRes.ok) {
-        throw new Error(saltData.error || "User vault registration not detected.");
+      if (totpRequired && pendingLoginRef.current) {
+        // Second-factor retry: reuse derived keys from the password step
+        ({ encryptionKey, clientAuthHash } = pendingLoginRef.current);
+      } else {
+        // 1. Retreive server encryption salt for target profile
+        const saltRes = await fetch("/api/auth/salt", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username: username.trim() }),
+        });
+
+        const saltData = await saltRes.json();
+        if (!saltRes.ok) {
+          throw new Error(saltData.error || "User vault registration not detected.");
+        }
+
+        const { salt, iterations } = saltData;
+
+        // 2. Derive authentic keys from master inputs (per-account KDF params)
+        const derived = await deriveUserKeys(password, salt, iterations);
+        encryptionKey = derived.encryptionKey;
+
+        // 3. Hash derived AuthKey for safe checking
+        clientAuthHash = await hashSHA256(derived.authKeyHex);
+        pendingLoginRef.current = { encryptionKey, clientAuthHash };
       }
 
-      const { salt } = saltData;
-
-      // 2. Derive authentic keys from master inputs
-      const { encryptionKey, authKeyHex } = await deriveUserKeys(password, salt);
-
-      // 3. Hash derived AuthKey for safe checking
-      const clientAuthHash = await hashSHA256(authKeyHex);
-
-      // 4. Submit login check to the server
+      // 4. Submit login check to the server (with 2FA code when requested)
       const loginRes = await fetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           username: username.trim(),
           authKeyHex: clientAuthHash,
+          ...(totpRequired && totpCode ? { totpCode } : {}),
         }),
       });
 
       const loginData = await loginRes.json();
       if (!loginRes.ok) {
+        if (loginData.totpRequired) {
+          setTotpRequired(true);
+          setLoading(false);
+          if (totpCode) setError(loginData.error || "Invalid verification code.");
+          setTotpCode("");
+          return;
+        }
+        pendingLoginRef.current = null;
         throw new Error(loginData.error || "Master credential verification failed.");
       }
+
+      pendingLoginRef.current = null;
+      setTotpRequired(false);
+      setTotpCode("");
 
       setSuccess("Master password valid. Vault unlocked!");
       setTimeout(() => {
@@ -159,108 +196,68 @@ export default function AuthScreen({ onUnlockSuccess }: AuthScreenProps) {
     }
   };
 
-  // Handler for Biometric Unlock Success
-  const handleBiometricSuccess = async (credentialId: string, signature: string) => {
+  // Read the local biometric key container (v2: PRF-wrapped master password)
+  const readBioMeta = (): { prfSalt: string; iv: string; cipherMaster: string } | null => {
+    try {
+      const raw = localStorage.getItem(`securepassx-bio-meta-${username.trim().toLowerCase()}`);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (parsed?.v !== 2 || !parsed.prfSalt || !parsed.iv || !parsed.cipherMaster) return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  };
+
+  // Handler for a server-verified WebAuthn assertion. The session token is
+  // real, but the vault key only becomes available if the authenticator's
+  // PRF output can unwrap the locally cached master password.
+  const handleBiometricSuccess = async (result: BiometricAuthResult) => {
     setBioPromptOpen(false);
     setError("");
     setLoading(true);
 
     try {
-      const res = await fetch("/api/auth/biometric/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          username: username.trim(),
-          challengeSignature: signature,
-          credentialId,
-        }),
-      });
-
-      const loginData = await res.json();
-      if (!res.ok) {
-        throw new Error(loginData.error || "Biometric validation check failed on host.");
-      }
-
-      // Restoring encryption key!
-      // In a real WebAuthn biometric E2EE scenario, we store a secondary E2EE blob encrypted with a key derived from biometrics,
-      // and we download it and wrap decrypt it. For the sandboxed preview simulation and real deployment consistency,
-      // we can securely prompt the user to type in their Master Password once during setting up biometric, or we recover a local
-      // encrypted file container from localStorage unlocked via the biometric signature!
-      // Let's implement this gorgeous local-crypt-store recovery mechanism in localStorage. If it exists, we unlock the CryptoKey
-      // derived from the cached key, meaning the biometric login provides ACTUAL decryption!
-      // Let's check from localStorage:
-      const savedEncryptedKey = localStorage.getItem(`securepassx-bio-meta-${username.trim().toLowerCase()}`);
-      if (!savedEncryptedKey) {
+      const meta = readBioMeta();
+      if (!meta) {
         throw new Error(
-          "Biometric registry exists, but your secure local key container was purged. Please unlock with master password once to re-sync."
+          "Biometric identity verified, but no local key container exists on this device. " +
+            "Unlock with your master password, then re-register biometrics from the dashboard."
+        );
+      }
+      if (!result.prfSecret) {
+        throw new Error(
+          "Biometric identity verified, but the authenticator did not return a PRF secret " +
+            "(this browser/authenticator may not support the PRF extension). Unlock with your master password."
         );
       }
 
-      const parsedMeta = JSON.parse(savedEncryptedKey);
-      // Construct a PBKDF2 KDF using biometric signature as master seed to decrypt the cached Master Password!
-      const userSalt = parsedMeta.salt;
-      const { encryptionKey } = await deriveUserKeys(signature, userSalt);
-      
-      // Decrypt the raw stored master password in the device
-      const rawDecryptedMaster = await decryptCachedMasterPassword(
-        parsedMeta.cipherPassword,
-        parsedMeta.iv,
-        encryptionKey
-      );
+      // 1. Unwrap the cached master password with the PRF-derived key
+      const wrapKey = await deriveKeyFromPrfSecret(result.prfSecret, meta.prfSalt);
+      const rawDecryptedMaster = await decryptString(meta.cipherMaster, meta.iv, wrapKey);
 
-      // Re-derive original E2E symmetric vault key using original user salt and decrypted master
-      const originalSaltRes = await fetch("/api/auth/salt", {
+      // 2. Re-derive the vault key with the account's salt + KDF params
+      const saltRes = await fetch("/api/auth/salt", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: username.trim() }),
       });
-      const originalSaltData = await originalSaltRes.json();
-      if (!originalSaltRes.ok) {
+      const saltData = await saltRes.json();
+      if (!saltRes.ok) {
         throw new Error("Unable to synchronize master salt records.");
       }
 
-      const { encryptionKey: finalDecryptionKey } = await deriveUserKeys(
-        rawDecryptedMaster,
-        originalSaltData.salt
-      );
+      const { encryptionKey } = await deriveUserKeys(rawDecryptedMaster, saltData.salt, saltData.iterations);
 
-      setSuccess("Biometric Touch ID confirmed. Vault decrypted successfully.");
+      setSuccess("Biometric identity confirmed. Vault decrypted successfully.");
       setTimeout(() => {
-        triggerPostSession(
-          loginData.userId,
-          loginData.username,
-          finalDecryptionKey,
-          loginData.token,
-          true
-        );
+        triggerPostSession(result.userId, result.username, encryptionKey, result.token, true);
       }, 800);
     } catch (err: any) {
       setError(err.message || "Failed to unlock using biometrics.");
       setLoading(false);
     }
   };
-
-  // Helper decryptors for biometric recovery
-  async function decryptCachedMasterPassword(cipher: string, iv: string, key: CryptoKey): Promise<string> {
-    const dataBuffer = base64ToBuffer(cipher);
-    const ivBuffer = base64ToBuffer(iv);
-    const decoder = new TextDecoder();
-    const decryptedBuffer = await window.crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: new Uint8Array(ivBuffer) },
-      key,
-      dataBuffer
-    );
-    return decoder.decode(decryptedBuffer);
-  }
-
-  function base64ToBuffer(base64: string): ArrayBuffer {
-    const binary = window.atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes.buffer;
-  }
 
   // Password Strength estimator for feedback during registration
   const estimateMasterStrength = () => {
@@ -364,11 +361,34 @@ export default function AuthScreen({ onUnlockSuccess }: AuthScreenProps) {
                   type="password"
                   required
                   value={password}
-                  onChange={(e) => setPassword(e.target.value)}
+                  onChange={(e) => {
+                    setPassword(e.target.value);
+                    // Cached derived keys are stale once the password changes
+                    pendingLoginRef.current = null;
+                    setTotpRequired(false);
+                  }}
                   placeholder="Master Key passphrase"
                   className="w-full bento-input py-3 px-4 text-xs text-slate-100 placeholder-slate-600 transition-all font-sans"
                 />
               </div>
+
+              {totpRequired && (
+                <div>
+                  <label className="block text-[11px] font-mono font-semibold uppercase tracking-wider text-amber-400 mb-1.5 ml-1">
+                    Two-Factor Verification Code
+                  </label>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    autoFocus
+                    maxLength={6}
+                    value={totpCode}
+                    onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, ""))}
+                    placeholder="6-digit code from authenticator app"
+                    className="w-full bento-input py-3 px-4 text-xs text-slate-100 placeholder-slate-600 transition-all font-mono tracking-widest"
+                  />
+                </div>
+              )}
 
               <div className="flex items-start gap-2.5 pt-1 font-sans text-xs text-slate-400 leading-relaxed bg-[#020617]/50 p-4 rounded-2xl border border-[#1e293b]">
                 <DatabaseZap className="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" />
@@ -525,7 +545,8 @@ export default function AuthScreen({ onUnlockSuccess }: AuthScreenProps) {
           onClose={() => setBioPromptOpen(false)}
           username={username}
           mode="authenticate"
-          onSuccess={handleBiometricSuccess}
+          prfSalt={readBioMeta()?.prfSalt || null}
+          onAuthSuccess={handleBiometricSuccess}
         />
       </motion.div>
     </div>

@@ -6,21 +6,46 @@
 import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Fingerprint, ScanEye, X, ShieldAlert, CheckCircle2 } from "lucide-react";
+import {
+  isWebAuthnAvailable,
+  performRegistrationCeremony,
+  performAuthenticationCeremony,
+} from "../lib/webauthn";
+
+export interface BiometricRegisterResult {
+  prfSalt: string;
+  prfSecret: ArrayBuffer | null;
+}
+
+export interface BiometricAuthResult {
+  token: string;
+  userId: number;
+  username: string;
+  prfSecret: ArrayBuffer | null;
+}
 
 interface BiometricPromptProps {
   isOpen: boolean;
   onClose: () => void;
   username: string;
-  onSuccess: (credentialId: string, signature: string) => void;
   mode: "register" | "authenticate";
+  /** Session token; required for register mode. */
+  token?: string;
+  /** PRF salt from the local key container; used in authenticate mode. */
+  prfSalt?: string | null;
+  onRegisterSuccess?: (result: BiometricRegisterResult) => void;
+  onAuthSuccess?: (result: BiometricAuthResult) => void;
 }
 
 export default function BiometricPrompt({
   isOpen,
   onClose,
   username,
-  onSuccess,
   mode,
+  token,
+  prfSalt,
+  onRegisterSuccess,
+  onAuthSuccess,
 }: BiometricPromptProps) {
   const [status, setStatus] = useState<"idle" | "scanning" | "success" | "error">("idle");
   const [errorMessage, setErrorMessage] = useState("");
@@ -30,94 +55,115 @@ export default function BiometricPrompt({
     if (isOpen) {
       setStatus("idle");
       setErrorMessage("");
-      // Randomly default type for premium variety look
       setBioType(Math.random() > 0.5 ? "fingerprint" : "faceid");
     }
   }, [isOpen]);
+
+  const fetchJson = async (url: string, body: unknown, authToken?: string) => {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || "Biometric server request failed.");
+    }
+    return data;
+  };
+
+  // Registration: create the credential, verify it server-side, then run one
+  // authentication ceremony with the PRF extension to obtain the local
+  // key-wrapping secret.
+  const runRegistration = async () => {
+    if (!token) throw new Error("Missing session token for biometric setup.");
+
+    const options = await fetchJson("/api/auth/webauthn/register/options", {}, token);
+    const { responseJSON, prfEnabled } = await performRegistrationCeremony(options);
+
+    // Human-readable device label for the passkey list
+    const ua = navigator.userAgent;
+    const browser = /Edg\//.test(ua) ? "Edge" : /Chrome\//.test(ua) ? "Chrome" : /Safari\//.test(ua) ? "Safari" : /Firefox\//.test(ua) ? "Firefox" : "Browser";
+    const platform = /Mac/.test(ua) ? "macOS" : /Windows/.test(ua) ? "Windows" : /Linux/.test(ua) ? "Linux" : /iPhone|iPad/.test(ua) ? "iOS" : /Android/.test(ua) ? "Android" : "Device";
+    const label = `${browser} on ${platform}`;
+
+    await fetchJson("/api/auth/webauthn/register/verify", { response: responseJSON, label }, token);
+
+    // Evaluate PRF via an immediate authentication ceremony.
+    // 32 random bytes as a single valid base64 string.
+    const saltBytes = new Uint8Array(32);
+    window.crypto.getRandomValues(saltBytes);
+    let saltBinary = "";
+    saltBytes.forEach((b) => (saltBinary += String.fromCharCode(b)));
+    const newPrfSalt = window.btoa(saltBinary);
+
+    let prfSecret: ArrayBuffer | null = null;
+    if (!prfEnabled) {
+      console.warn("[webauthn] Authenticator reported prf.enabled !== true at creation; skipping PRF evaluation.");
+    } else {
+      try {
+        const authOptions = await fetchJson("/api/auth/webauthn/login/options", { username });
+        const authResult = await performAuthenticationCeremony(authOptions, newPrfSalt);
+        await fetchJson("/api/auth/webauthn/login/verify", {
+          username,
+          response: authResult.responseJSON,
+        });
+        prfSecret = authResult.prfSecret;
+        if (!prfSecret) {
+          console.warn("[webauthn] PRF enabled at creation but no results returned at assertion.");
+        }
+      } catch (err) {
+        console.warn("PRF evaluation unavailable; biometric unlock will require master password.", err);
+      }
+    }
+
+    setStatus("success");
+    setTimeout(() => onRegisterSuccess?.({ prfSalt: newPrfSalt, prfSecret }), 800);
+  };
+
+  // Authentication: server-verified WebAuthn assertion (challenge/signature),
+  // with PRF evaluated against the stored salt for key recovery.
+  const runAuthentication = async () => {
+    const options = await fetchJson("/api/auth/webauthn/login/options", { username });
+    const { responseJSON, prfSecret } = await performAuthenticationCeremony(options, prfSalt || null);
+    const verifyData = await fetchJson("/api/auth/webauthn/login/verify", {
+      username,
+      response: responseJSON,
+    });
+
+    setStatus("success");
+    setTimeout(
+      () =>
+        onAuthSuccess?.({
+          token: verifyData.token,
+          userId: verifyData.userId,
+          username: verifyData.username,
+          prfSecret,
+        }),
+      800
+    );
+  };
 
   const handleStartBiometric = async () => {
     setStatus("scanning");
     setErrorMessage("");
 
     try {
-      // 1. Attempt genuine WebAuthn if available and allowed by context
-      if (window.PublicKeyCredential) {
-        // Attempt a standard light-weight navigator.credentials.create or get
-        // To prevent full crashing in restrictive iframes, we limit timeout and catch
-        const challenge = new Uint8Array(32);
-        window.crypto.getRandomValues(challenge);
-
-        if (mode === "register") {
-          // Attempting WebAuthn Credential Registration Config
-          const options: CredentialCreationOptions = {
-            publicKey: {
-              challenge,
-              rp: { name: "SecurePassX Secure Vault" },
-              user: {
-                id: new Uint8Array([1, 2, 3, 4]),
-                name: username,
-                displayName: username,
-              },
-              pubKeyCredParams: [{ type: "public-key", alg: -7 }], // ES256
-              timeout: 2000,
-              authenticatorSelection: {
-                authenticatorAttachment: "platform",
-                userVerification: "required",
-              },
-            },
-          };
-          
-          // We wrapped in a fast timeout fallback
-          const cred = await Promise.race([
-            navigator.credentials.create(options),
-            new Promise<null>((_, reject) => setTimeout(() => reject(new Error("Timeout")), 1500))
-          ]);
-
-          if (cred) {
-            setStatus("success");
-            setTimeout(() => {
-              onSuccess("webauthn-credential-id-real", "webauthn-signature-real");
-            }, 1000);
-            return;
-          }
-        } else {
-          // Auth flow option config
-          const options: CredentialRequestOptions = {
-            publicKey: {
-              challenge,
-              timeout: 1500,
-              allowCredentials: [],
-              userVerification: "required",
-            },
-          };
-          const assertion = await Promise.race([
-            navigator.credentials.get(options),
-            new Promise<null>((_, reject) => setTimeout(() => reject(new Error("Timeout")), 1500))
-          ]);
-          if (assertion) {
-            setStatus("success");
-            setTimeout(() => {
-              onSuccess("webauthn-credential-id-real", "webauthn-signature-real");
-            }, 1000);
-            return;
-          }
-        }
+      if (!isWebAuthnAvailable()) {
+        throw new Error("WebAuthn is not available in this browser/context (HTTPS or localhost required).");
       }
-      throw new Error("Sandbox iframe constraints; fallback to high-fidelity biometric simulator.");
+      if (mode === "register") {
+        await runRegistration();
+      } else {
+        await runAuthentication();
+      }
     } catch (err: any) {
-      // Standard flow inside sandbox iframe is to trigger fallback simulator smoothly
-      console.log("WebAuthn real API skipped or failed, activating secure fallback simulator:", err.message);
-      
-      // Keep scanning visual state going for a highly satisfying 1.2s delay
-      setTimeout(() => {
-        setStatus("success");
-        setTimeout(() => {
-          onSuccess(
-            `mock-bio-credential-securepassx-${username}`,
-            `mock-bio-sig-sha256-${Date.now()}`
-          );
-        }, 1000);
-      }, 1500);
+      console.error("WebAuthn ceremony failed:", err);
+      setErrorMessage(err?.message || "Biometric ceremony failed.");
+      setStatus("error");
     }
   };
 
@@ -217,9 +263,7 @@ export default function BiometricPrompt({
                 </div>
 
                 <p className="font-mono text-xs text-slate-400 mt-4 animate-pulse">
-                  {bioType === "fingerprint"
-                    ? "Verify Touch ID signature..."
-                    : "Calibrating Face ID facial recognition grid..."}
+                  Waiting for device authenticator confirmation...
                 </p>
               </motion.div>
             )}
@@ -237,7 +281,7 @@ export default function BiometricPrompt({
                   Identity Authenticated
                 </h4>
                 <p className="font-mono text-[10px] text-slate-500 mt-1 uppercase tracking-widest">
-                  End-to-End Key Released
+                  WebAuthn Signature Verified
                 </p>
               </motion.div>
             )}
@@ -254,7 +298,7 @@ export default function BiometricPrompt({
                 <p className="font-sans text-xs text-rose-300 mt-3 font-medium">
                   Authentication Rejected
                 </p>
-                <p className="font-mono text-[10px] text-slate-500 mt-1">
+                <p className="font-mono text-[10px] text-slate-500 mt-1 px-4">
                   {errorMessage || "Biometrics verification cancelled."}
                 </p>
                 <button
@@ -280,10 +324,10 @@ export default function BiometricPrompt({
           <div className="h-6 w-[1px] bg-slate-800" />
           <div className="flex flex-col text-right">
             <span className="font-sans text-[10px] text-slate-500 uppercase font-semibold">
-              Device Sync
+              Authenticator
             </span>
             <span className="font-mono text-[11px] text-emerald-500 font-semibold uppercase">
-              Local SQLite
+              WebAuthn + PRF
             </span>
           </div>
         </div>

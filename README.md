@@ -1,75 +1,77 @@
 # SecurePassX
 
-**SecurePassX** is a modern, high-performance, and visually gorgeous End-to-End Encrypted (E2EE) password manager designed around a modular **Bento Grid** user interface. It combines client-side zero-knowledge cryptographic operations with an encrypted, light-weight SQLite database backend.
+A self-hosted, end-to-end encrypted (E2EE) password manager. All vault content is encrypted in the browser with a key derived from your master password; the server and its SQLite database only ever see ciphertext.
 
----
+> **Zero-knowledge means zero recovery**: if you lose the master password, the vault cannot be decrypted. Keep an encrypted export and its passphrase somewhere safe.
 
-## 🎨 Visual Identity & Bento Theme
+## Security Architecture
 
-SecurePassX utilizes a stunning, dark-mode **Bento-Grid** interface layout that offers high visual rhythm, generous negative space, and responsive modular widgets:
-* **Slate & Emerald Palette**: High-contrast, easy-on-the-eyes slate primary containers accented with vibrant emerald interactive indicators.
-* **Responsive Bento Layout**: Beautifully organized cards for credentials streams, interactive biometric bypass, rapid password generators, local system metrics, and auto-lock timers.
-* **Micro-interactions**: Elegant state transition curves, real-time keyboard/mouse activity auto-lock counts, and copy-feedback indicators.
+### Client-side (zero-knowledge)
 
----
+- **Key derivation**: PBKDF2-HMAC-SHA-256, 600,000 iterations (Web Crypto API), producing an AES-256-GCM vault key and an independent server-auth proof. The master password never leaves the browser. Existing accounts keep their original iteration count (served per-account by `/api/auth/salt`).
+- **E2EE**: every credential field and audit-log item name is AES-256-GCM encrypted client-side, each field with its own random IV.
+- **Biometric unlock (WebAuthn + PRF)**: passkey registration and login use server-verified challenges (`@simplewebauthn/server`). If the authenticator supports the PRF extension, its output derives (via HKDF) a local key that wraps the master password — biometric login then fully decrypts the vault. Without PRF, biometrics authenticate the session only. Multiple passkeys per account are supported and managed in the Security Center.
+- **Two-factor auth (TOTP)**: RFC 6238 codes required on password logins once enabled (QR-code setup). Passkey logins skip TOTP (already two factors).
 
-## 🔒 Security & Cryptographic Architecture
+### Server-side
 
-### 1. Zero-Knowledge Proof (Client-side)
-* **Master Keys Derivation**: Your Master Password never goes to the server in cleartext. High-iteration **PBKDF2 with HMAC-SHA-256** runs purely in your browser using the Native Web Crypto API to derive both the **Symmetric Encryption Key** and the **Server Authorization Token**.
-* **E2EE Symmetric Encryption**: Records (including titles, user identifiers, passwords, notes, URLs, and categories) are fully encrypted inside your browser using **AES-256-GCM** before transmission. Encryption vectors (IVs) are generated via cryptographically secure random values.
-* **Local Crypto Storage**: Secure biometric authentication utilizes a localized metadata container inside your browser’s localStorage to hold and decrypt credentials safely without exposing master parameters.
+- **At rest**: every value is AES-256-GCM encrypted with a data key HKDF-derived from `DB_ENCRYPTION_KEY`. If the env var is unset, a random key is generated once and persisted as `securepassx.key` next to the database — no hardcoded defaults. Back that file up.
+- **Auth-proof storage**: one-way scrypt with per-user salt, compared with `timingSafeEqual` — a DB + key leak does not permit login.
+- **Sessions**: signed HS256 JWTs (8h TTL) with server-side revocation on logout/auto-lock.
+- **Abuse protection**: rate limiting on auth routes, per-account lockout (15 min after 5 failures), `helmet` headers (CSP + HSTS in production), HTTPS redirect behind a proxy, and anti-enumeration decoy salts for unknown usernames.
+- **Backups**: consistent snapshots (`VACUUM INTO`) at startup and every 24h, encrypted with a derived backup key, last 7 kept under `<db-dir>/backups/`. Restore: `node scripts/decrypt-backup.mjs <backup.db.enc> <out.db> [keyfile]`.
+- **Master password change**: Security Center re-encrypts the whole vault client-side and swaps it atomically on the server; passkey containers must be re-registered afterwards.
 
-### 2. Double-Layered Server Encryption (SQLite)
-* **Encryption at Rest**: The Node.js SQLite (`securepassx.db`) database uses dual-layered **AES-256-CBC value-level ciphers** using the `DB_ENCRYPTION_KEY` environment variable.
-* Even if an attacker obtains a full copy of the raw SQLite database, the content of your cards remains doubly garbled and completely unbreakable without the specific user Master Password.
+## Features
 
----
+- Create, edit, search, categorize, and favorite credential entries; password generator with configurable policy.
+- Security Center: passkey management, TOTP 2FA, master password rotation.
+- Passphrase-encrypted portable backup export and import (restorable into any account).
+- Audit trail of vault actions and auth events (logins, failures, lockouts, passkey/2FA changes).
+- Auto-lock after 5 minutes of inactivity; copied secrets wiped from the clipboard after 30 seconds and on lock.
 
-## 🚀 Key Functional Features
+## Quick Start
 
-- **Decentralized Credentials Stream**: Create, read, update, categorize, tag favorites, search, and purge password entries in real-time.
-- **Auto-Lock Sequence**: Monitored user activity counters automatically lock your unlocked sessions after **5 minutes of inactivity** to prevent physical intrusion.
-- **Biometric FaceID/TouchID bypass (WebAuthn Emulated)**: Fast secure unlocking from trusted browsers after registration.
-- **Password Strength Audit**: Real-time analytical grading scorecard for your passive credential hygiene.
-- **Secure Exports**: Instantly download your database in either a master-encrypted E2EE backup package or a human-readable decrypted plaintext JSON bundle.
-- **Flexible Password Generator**: Detailed entropy customizer supporting symbols, numbers, capitalizations, and length parameters.
-
----
-
-## ⚙️ Development & Quick Start
-
-### 1. Local Development
-Ensure you have Node.js (v18+) and your system dependencies installed:
+### Local development
 
 ```bash
-# Install core packages
 npm install
-
-# Start the dev server (Vite + Express on TSX)
-npm run dev
+npm run dev        # Vite + Express on http://localhost:3000
 ```
 
-The application dev server will boot instantly on http://localhost:3000.
+WebAuthn/biometrics require a secure context: use `localhost` or HTTPS.
 
-### 2. Docker Deployment
-Ensure you have Docker and Docker Compose installed:
+### Docker
 
 ```bash
-# Boot the fully containerized server and volumes
-docker-compose up --build
+cp .env.example .env   # set DB_ENCRYPTION_KEY (openssl rand -hex 32)
+docker compose up --build
 ```
 
-The Compose environment binds port `3000`, links custom volume storage securely, and configures database parameters for production.
+Serves on port 3001; database, key file, and backups persist in the `securepassx_storage` volume.
 
----
+### Environment variables
 
-## 📂 Project Architecture
+| Variable | Default | Purpose |
+|---|---|---|
+| `DB_ENCRYPTION_KEY` | auto-generated `securepassx.key` | Master key material for at-rest encryption, JWT signing, and backups (min 16 chars) |
+| `DB_PATH` | `./securepassx.db` | SQLite database location |
 
-* `/server.ts` — Standalone production Express API handling SQLite queries, SQLite value ciphers at rest, and Vite middleware.
-* `/src/App.tsx` — Root component routing between the unified Login/Register view and the primary dashboard.
-* `/src/components/VaultDashboard.tsx` — Modular dashboard constructed within bento elements.
-* `/src/components/AuthScreen.tsx` — E2E login/register portal executing PBKDF2 hashing.
-* `/src/components/BiometricPrompt.tsx` — Local biometric touch registers.
-* `/src/lib/crypto.ts` — Web Cryptography helpers mapping named browser ciphers.
-* `/src/types.ts` — Centralized TypeScript interfaces for strict typing.
+## Deployment Notes
+
+- Prefer keeping the app off the public internet (localhost, LAN, or a VPN like Tailscale). If it must be public, front it with a TLS reverse proxy.
+- Back up `securepassx.key` (or your `DB_ENCRYPTION_KEY`) separately from the database; without it, the DB and automated backups are unrecoverable.
+- For whole-file DB encryption on top of value-level GCM, swap `sqlite3` for `@journeyapps/sqlcipher` and set `PRAGMA key` after opening.
+
+## Project Structure
+
+- `server.ts` — Express API: auth, WebAuthn, TOTP, vault CRUD, key rotation, backups, at-rest encryption.
+- `src/App.tsx` — root component switching between auth screen and dashboard.
+- `src/components/AuthScreen.tsx` — login/register with KDF, TOTP step, and biometric unlock.
+- `src/components/VaultDashboard.tsx` — vault UI, import/export, audit log.
+- `src/components/SecurityCenter.tsx` — passkeys, 2FA, master password change.
+- `src/components/BiometricPrompt.tsx` — WebAuthn ceremony UI.
+- `src/lib/crypto.ts` — Web Crypto helpers (PBKDF2, AES-GCM, HKDF/PRF).
+- `src/lib/webauthn.ts` — WebAuthn ceremony serialization + PRF evaluation.
+- `src/lib/vault.ts` — shared E2EE credential payload builder.
+- `scripts/decrypt-backup.mjs` — offline backup restore tool.

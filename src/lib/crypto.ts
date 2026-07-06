@@ -40,10 +40,16 @@ export async function hashSHA256(text: string): Promise<string> {
   return hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
+// OWASP-recommended PBKDF2-SHA256 work factor (2024+): 600k iterations.
+// Existing accounts keep the iteration count they registered with (served
+// by /api/auth/salt) so their derived keys stay stable.
+export const DEFAULT_KDF_ITERATIONS = 600_000;
+
 // Derive both Encryption and Server Verification Keys using PBKDF2-SHA256
 export async function deriveUserKeys(
   password: string,
-  saltBase64: string
+  saltBase64: string,
+  iterations: number = DEFAULT_KDF_ITERATIONS
 ): Promise<{ encryptionKey: CryptoKey; authKeyHex: string }> {
   const encoder = new TextEncoder();
   const passwordBuffer = encoder.encode(password);
@@ -63,7 +69,7 @@ export async function deriveUserKeys(
     {
       name: "PBKDF2",
       salt: saltBuffer,
-      iterations: 100000,
+      iterations,
       hash: "SHA-256",
     },
     baseKey,
@@ -79,7 +85,7 @@ export async function deriveUserKeys(
     {
       name: "PBKDF2",
       salt: authSaltBuffer,
-      iterations: 100000,
+      iterations,
       hash: "SHA-256",
     },
     baseKey,
@@ -90,6 +96,29 @@ export async function deriveUserKeys(
   const authKeyHex = authArray.map(b => b.toString(16).padStart(2, "0")).join("");
 
   return { encryptionKey, authKeyHex };
+}
+
+// Derive an AES-GCM key from a WebAuthn PRF secret via HKDF.
+// Used to locally wrap/unwrap the master password for biometric unlock.
+export async function deriveKeyFromPrfSecret(
+  prfSecret: ArrayBuffer,
+  saltBase64: string
+): Promise<CryptoKey> {
+  const baseKey = await window.crypto.subtle.importKey("raw", prfSecret, { name: "HKDF" }, false, [
+    "deriveKey",
+  ]);
+  return window.crypto.subtle.deriveKey(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: base64ToBuffer(saltBase64),
+      info: new TextEncoder().encode("securepassx-bio-wrap-v2"),
+    },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
 }
 
 // Encrypt string with AES-GCM 256

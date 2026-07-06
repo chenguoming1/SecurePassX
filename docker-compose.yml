@@ -7,14 +7,22 @@ services:
       dockerfile: Dockerfile
     container_name: securepassx_vault
     ports:
-      - "3000:3000"
+      - "3001:3000"
     environment:
       - NODE_ENV=production
-      - DB_ENCRYPTION_KEY="custom_production_key_must_be_32_characters_for_secure_sqlite"
+      # Set DB_ENCRYPTION_KEY in a .env file next to this compose file (never
+      # commit it). If unset, the server generates a random key and persists
+      # it inside the data volume (/app/data/securepassx.key) - back it up!
+      - DB_ENCRYPTION_KEY=${DB_ENCRYPTION_KEY:-}
       - DB_PATH=/app/data/securepassx.db
     volumes:
       - securepassx_storage:/app/data
     restart: unless-stopped
+
+# Note on whole-file encryption: values are individually encrypted with
+# AES-256-GCM before hitting SQLite. For additional full-database encryption,
+# swap the sqlite3 driver for @journeyapps/sqlcipher (SQLCipher) and set
+# `PRAGMA key` after opening the DB - see README.
 
 volumes:
   securepassx_storage:

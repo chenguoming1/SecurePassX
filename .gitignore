@@ -6,3 +6,8 @@ coverage/
 *.log
 .env*
 !.env.example
+*.db
+*.db.enc
+securepassx.key
+backups/
+data/
