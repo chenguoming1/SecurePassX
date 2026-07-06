@@ -27,7 +27,11 @@ interface AuthScreenProps {
 }
 
 export default function AuthScreen({ onUnlockSuccess }: AuthScreenProps) {
-  const [formMode, setFormMode] = useState<"login" | "register">("login");
+  const [formMode, setFormMode] = useState<"login" | "register" | "join">("login");
+
+  // Device-sync join (pair this fresh server with a hub)
+  const [joinPeerUrl, setJoinPeerUrl] = useState("");
+  const [joinSecret, setJoinSecret] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -192,6 +196,44 @@ export default function AuthScreen({ onUnlockSuccess }: AuthScreenProps) {
       }, 800);
     } catch (err: any) {
       setError(err.message || "Invalid authentication coordinates.");
+      setLoading(false);
+    }
+  };
+
+  // Pair this server with a sync hub and import the vault
+  const handleJoinSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError("");
+    setSuccess("");
+
+    if (!joinPeerUrl.trim() || !joinSecret.trim() || !username.trim()) {
+      setError("Hub URL, pairing secret, and your vault username are required.");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const res = await fetch("/api/sync/join", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          peerUrl: joinPeerUrl.trim(),
+          secret: joinSecret.trim(),
+          username: username.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Pairing failed.");
+
+      setSuccess("Vault imported from hub! Log in with your master password.");
+      setJoinSecret("");
+      setTimeout(() => {
+        setFormMode("login");
+        setSuccess("Vault synced to this device. Unlock with your master password.");
+        setLoading(false);
+      }, 1200);
+    } catch (err: any) {
+      setError(err.message || "Pairing failed.");
       setLoading(false);
     }
   };
@@ -431,13 +473,97 @@ export default function AuthScreen({ onUnlockSuccess }: AuthScreenProps) {
                 </button>
               </div>
 
-              <div className="text-center pt-3">
+              <div className="text-center pt-3 space-y-1.5">
                 <button
                   type="button"
                   onClick={() => setFormMode("register")}
-                  className="font-sans text-xs text-emerald-400 hover:text-emerald-300 font-medium transition-colors cursor-pointer"
+                  className="block w-full font-sans text-xs text-emerald-400 hover:text-emerald-300 font-medium transition-colors cursor-pointer"
                 >
                   Don&apos;t have a master file? Create Vault Account
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFormMode("join")}
+                  className="block w-full font-sans text-xs text-sky-400 hover:text-sky-300 font-medium transition-colors cursor-pointer"
+                >
+                  Have a vault on another laptop? Join synced vault
+                </button>
+              </div>
+            </motion.form>
+          ) : formMode === "join" ? (
+            <motion.form
+              key="join-form"
+              onSubmit={handleJoinSubmit}
+              initial={{ opacity: 0, x: 15 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -15 }}
+              className="space-y-4 text-left"
+            >
+              <div>
+                <label className="block text-[11px] font-mono font-semibold uppercase tracking-wider text-slate-400 mb-1.5 ml-1">
+                  Hub Server URL
+                </label>
+                <input
+                  type="url"
+                  required
+                  value={joinPeerUrl}
+                  onChange={(e) => setJoinPeerUrl(e.target.value)}
+                  placeholder="http://laptop-a.tailnet:3000"
+                  className="w-full bento-input py-3 px-4 text-xs text-slate-100 placeholder-slate-600 transition-all font-mono"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-mono font-semibold uppercase tracking-wider text-slate-400 mb-1.5 ml-1">
+                  Vault Username
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="Username of the account on the hub"
+                  className="w-full bento-input py-3 px-4 text-xs text-slate-100 placeholder-slate-600 transition-all font-sans"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-mono font-semibold uppercase tracking-wider text-slate-400 mb-1.5 ml-1">
+                  Pairing Secret
+                </label>
+                <input
+                  type="password"
+                  required
+                  value={joinSecret}
+                  onChange={(e) => setJoinSecret(e.target.value)}
+                  placeholder="Secret generated in the hub's Security Center"
+                  className="w-full bento-input py-3 px-4 text-xs text-slate-100 placeholder-slate-600 transition-all font-mono"
+                />
+              </div>
+
+              <div className="flex items-start gap-2.5 pt-1 font-sans text-xs text-slate-400 leading-relaxed bg-[#020617]/50 p-4 rounded-2xl border border-[#1e293b]">
+                <DatabaseZap className="w-4 h-4 text-sky-500 shrink-0 mt-0.5" />
+                <span>
+                  This imports the account and encrypted vault from your other laptop, then keeps both in sync
+                  automatically. Your master password stays the same and never crosses the wire.
+                </span>
+              </div>
+
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full flex items-center justify-center gap-2 bento-btn-emerald text-white text-xs py-3.5 px-4 cursor-pointer disabled:opacity-50 transition-all"
+              >
+                {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : "Pair & Import Vault"}
+              </button>
+
+              <div className="text-center pt-3">
+                <button
+                  type="button"
+                  onClick={() => setFormMode("login")}
+                  className="font-sans text-xs text-emerald-400 hover:text-emerald-300 font-medium transition-colors cursor-pointer"
+                >
+                  Back to Unlock
                 </button>
               </div>
             </motion.form>

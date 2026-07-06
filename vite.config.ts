@@ -17,6 +17,9 @@ export default defineConfig(() => {
       hmr: process.env.DISABLE_HMR !== 'true',
       // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      // Allow access via LAN/Tailscale hostnames (Vite 6 blocks non-localhost
+      // Host headers by default). Dev-only; production serves static files.
+      allowedHosts: true as const,
     },
   };
 });

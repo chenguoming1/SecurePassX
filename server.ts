@@ -269,6 +269,45 @@ function verifyTotpCode(secretHex: string, code: string, lastCounter: number): n
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCKOUT_MS = 15 * 60 * 1000;
 
+// ---------------------------------------------------------------------------
+// Device sync: sealed transport. Every sync request/response body is
+// AES-256-GCM encrypted with a key derived from the shared pairing secret,
+// so sync works safely even over plain HTTP on a LAN/VPN. Payloads carry a
+// timestamp to bound replays. Note the vault data inside is E2EE blobs
+// anyway - peers never exchange plaintext passwords.
+// ---------------------------------------------------------------------------
+
+const SYNC_TS_SKEW_MS = 5 * 60 * 1000;
+const SYNC_INTERVAL_MS = 5 * 60 * 1000;
+
+function syncKeyFrom(secretHex: string): Buffer {
+  return Buffer.from(
+    crypto.hkdfSync("sha256", Buffer.from(secretHex, "hex"), Buffer.alloc(0), Buffer.from("securepassx/sync/v1"), 32)
+  );
+}
+
+function syncSeal(payload: unknown, secretHex: string): { iv: string; tag: string; data: string } {
+  const key = syncKeyFrom(secretHex);
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const encrypted = Buffer.concat([cipher.update(JSON.stringify(payload), "utf8"), cipher.final()]);
+  return { iv: iv.toString("hex"), tag: cipher.getAuthTag().toString("hex"), data: encrypted.toString("hex") };
+}
+
+function syncOpen(body: any, secretHex: string): any | null {
+  try {
+    const key = syncKeyFrom(secretHex);
+    const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(body.iv, "hex"));
+    decipher.setAuthTag(Buffer.from(body.tag, "hex"));
+    const plain = Buffer.concat([decipher.update(Buffer.from(body.data, "hex")), decipher.final()]).toString("utf8");
+    const payload = JSON.parse(plain);
+    if (!payload.ts || Math.abs(Date.now() - payload.ts) > SYNC_TS_SKEW_MS) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
 async function startServer() {
   const app = express();
   app.set("trust proxy", 1);
@@ -294,8 +333,10 @@ async function startServer() {
     })
   );
 
-  // Enforce HTTPS behind a reverse proxy in production.
-  if (IS_PRODUCTION) {
+  // HTTPS enforcement is opt-in (FORCE_HTTPS=true) for deployments behind a
+  // TLS reverse proxy. Left off by default so direct LAN/Tailscale access
+  // over plain HTTP isn't redirected to a nonexistent HTTPS listener.
+  if (IS_PRODUCTION && process.env.FORCE_HTTPS === "true") {
     app.use((req: Request, res: Response, next: NextFunction) => {
       if (req.secure || req.headers["x-forwarded-proto"] === "https" || req.hostname === "localhost") {
         return next();
@@ -382,6 +423,25 @@ async function startServer() {
       created_at INTEGER,
       FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS tombstones (
+      id TEXT PRIMARY KEY,
+      user_id INTEGER,
+      deleted_at INTEGER,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS sync_config (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      role TEXT,
+      peer_url TEXT,
+      username_hash TEXT,
+      secret_enc TEXT,
+      pull_since INTEGER DEFAULT 0,
+      push_since INTEGER DEFAULT 0,
+      last_sync_at INTEGER DEFAULT 0,
+      last_sync_error TEXT
+    );
   `);
 
   // Idempotent column migrations for older databases
@@ -398,6 +458,7 @@ async function startServer() {
     "ALTER TABLE users ADD COLUMN totp_last_counter INTEGER DEFAULT 0",
     "ALTER TABLE users ADD COLUMN failed_attempts INTEGER DEFAULT 0",
     "ALTER TABLE users ADD COLUMN lock_until INTEGER DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN updated_at INTEGER DEFAULT 0",
   ];
   for (const migration of migrations) {
     try {
@@ -560,14 +621,15 @@ async function startServer() {
       }
 
       const result = await db.run(
-        `INSERT INTO users (username_hash, username_enc, salt, password_hash, kdf_iterations, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO users (username_hash, username_enc, salt, password_hash, kdf_iterations, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [
           usernameHash,
           dbEncrypt(trimmedUsername),
           dbEncrypt(salt),
           hashAuthKey(String(passwordHash)),
           kdfIterations,
+          Date.now(),
           Date.now(),
         ]
       );
@@ -705,8 +767,8 @@ async function startServer() {
         return;
       }
       await db.run(
-        "UPDATE users SET totp_secret_enc = ?, totp_pending_enc = NULL, totp_enabled = 1, totp_last_counter = ? WHERE id = ?",
-        [dbEncrypt(secretHex), matched, req.userId]
+        "UPDATE users SET totp_secret_enc = ?, totp_pending_enc = NULL, totp_enabled = 1, totp_last_counter = ?, updated_at = ? WHERE id = ?",
+        [dbEncrypt(secretHex), matched, Date.now(), req.userId]
       );
       await serverAudit(req.userId!, "totp_enabled", "Two-factor authentication enabled");
       res.json({ success: true });
@@ -730,8 +792,8 @@ async function startServer() {
         return;
       }
       await db.run(
-        "UPDATE users SET totp_secret_enc = NULL, totp_pending_enc = NULL, totp_enabled = 0, totp_last_counter = 0 WHERE id = ?",
-        [req.userId]
+        "UPDATE users SET totp_secret_enc = NULL, totp_pending_enc = NULL, totp_enabled = 0, totp_last_counter = 0, updated_at = ? WHERE id = ?",
+        [Date.now(), req.userId]
       );
       await serverAudit(req.userId!, "totp_disabled", "Two-factor authentication disabled");
       res.json({ success: true });
@@ -1120,6 +1182,12 @@ async function startServer() {
       }
 
       await db.run("DELETE FROM credentials WHERE id = ? AND user_id = ?", [credentialId, req.userId]);
+      // Tombstone so the deletion propagates to synced peers
+      await db.run("INSERT OR REPLACE INTO tombstones (id, user_id, deleted_at) VALUES (?, ?, ?)", [
+        credentialId,
+        req.userId,
+        Date.now(),
+      ]);
       res.json({ success: true, message: "Item securely purged from server storage." });
     } catch (error) {
       console.error("Delete credential error:", error);
@@ -1175,8 +1243,8 @@ async function startServer() {
       await db.exec("BEGIN TRANSACTION");
       try {
         await db.run(
-          "UPDATE users SET salt = ?, password_hash = ?, kdf_iterations = ? WHERE id = ?",
-          [dbEncrypt(String(newSalt)), hashAuthKey(String(newPasswordHash)), kdfIterations, req.userId]
+          "UPDATE users SET salt = ?, password_hash = ?, kdf_iterations = ?, updated_at = ? WHERE id = ?",
+          [dbEncrypt(String(newSalt)), hashAuthKey(String(newPasswordHash)), kdfIterations, Date.now(), req.userId]
         );
 
         for (const c of credentials) {
@@ -1271,6 +1339,342 @@ async function startServer() {
       res.status(500).json({ error: "Failed to log event operation." });
     }
   });
+
+  // -------------------------------------------------------------------------
+  // DEVICE SYNC (hub-and-spoke)
+  // The "hub" holds the pairing secret and passively serves /api/sync/exchange.
+  // A "joiner" imports the account once, then periodically exchanges deltas:
+  // it pushes its local changes and receives the hub's. Merges are
+  // last-write-wins per credential with deletion tombstones.
+  // -------------------------------------------------------------------------
+
+  const getSyncConfig = () => db.get("SELECT * FROM sync_config WHERE id = 1");
+
+  // Collect this server's state for one account since a watermark
+  async function gatherSyncData(userId: number, since: number) {
+    const user = await db.get("SELECT * FROM users WHERE id = ?", [userId]);
+    const creds = await db.all("SELECT * FROM credentials WHERE user_id = ? AND modified_at > ?", [userId, since]);
+    const tombs = await db.all("SELECT * FROM tombstones WHERE user_id = ? AND deleted_at > ?", [userId, since]);
+    const passkeys = await db.all("SELECT * FROM webauthn_credentials WHERE user_id = ?", [userId]);
+
+    return {
+      account: {
+        usernameHash: user.username_hash,
+        username: dbDecrypt(user.username_enc),
+        salt: dbDecrypt(user.salt),
+        passwordHash: user.password_hash, // one-way scrypt string
+        kdfIterations: user.kdf_iterations,
+        totpEnabled: !!user.totp_enabled,
+        totpSecretHex: user.totp_secret_enc ? dbDecrypt(user.totp_secret_enc) : "",
+        totpLastCounter: user.totp_last_counter || 0,
+        createdAt: user.created_at,
+        updatedAt: user.updated_at || 0,
+      },
+      credentials: creds.map((row) => ({
+        id: row.id,
+        title: dbDecrypt(row.title_enc),
+        usernameEnc: dbDecrypt(row.username_enc),
+        passwordEnc: dbDecrypt(row.password_enc),
+        urlEnc: dbDecrypt(row.url_enc),
+        notesEnc: dbDecrypt(row.notes_enc),
+        category: dbDecrypt(row.category_enc),
+        iv: dbDecrypt(row.iv),
+        modifiedAt: row.modified_at,
+      })),
+      tombstones: tombs.map((t) => ({ id: t.id, deletedAt: t.deleted_at })),
+      webauthn: passkeys.map((p) => ({
+        credId: dbDecrypt(p.cred_id),
+        pubkey: dbDecrypt(p.pubkey),
+        counter: p.counter || 0,
+        transports: dbDecrypt(p.transports) || "[]",
+        label: dbDecrypt(p.label) || "Synced device",
+        createdAt: p.created_at,
+      })),
+    };
+  }
+
+  // Merge a peer's state into this server. Returns stats.
+  async function applySyncData(data: any, allowCreateAccount: boolean) {
+    const stats = { credsApplied: 0, credsDeleted: 0, accountUpdated: false, passkeysAdded: 0 };
+    const acc = data.account;
+    if (!acc?.usernameHash) throw new Error("Sync payload missing account.");
+
+    let user = await db.get("SELECT * FROM users WHERE username_hash = ?", [acc.usernameHash]);
+
+    if (!user) {
+      if (!allowCreateAccount) throw new Error("Account not present on this server.");
+      await db.run(
+        `INSERT INTO users (username_hash, username_enc, salt, password_hash, kdf_iterations, totp_secret_enc, totp_enabled, totp_last_counter, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          acc.usernameHash,
+          dbEncrypt(acc.username),
+          dbEncrypt(acc.salt),
+          acc.passwordHash,
+          acc.kdfIterations || MIN_KDF_ITERATIONS,
+          acc.totpSecretHex ? dbEncrypt(acc.totpSecretHex) : null,
+          acc.totpEnabled ? 1 : 0,
+          acc.totpLastCounter || 0,
+          acc.createdAt || Date.now(),
+          acc.updatedAt || Date.now(),
+        ]
+      );
+      user = await db.get("SELECT * FROM users WHERE username_hash = ?", [acc.usernameHash]);
+      stats.accountUpdated = true;
+    } else if ((acc.updatedAt || 0) > (user.updated_at || 0)) {
+      // Peer has newer account material (password rotation / TOTP change)
+      await db.run(
+        `UPDATE users SET username_enc = ?, salt = ?, password_hash = ?, kdf_iterations = ?, totp_secret_enc = ?, totp_enabled = ?, updated_at = ? WHERE id = ?`,
+        [
+          dbEncrypt(acc.username),
+          dbEncrypt(acc.salt),
+          acc.passwordHash,
+          acc.kdfIterations || MIN_KDF_ITERATIONS,
+          acc.totpSecretHex ? dbEncrypt(acc.totpSecretHex) : null,
+          acc.totpEnabled ? 1 : 0,
+          acc.updatedAt,
+          user.id,
+        ]
+      );
+      stats.accountUpdated = true;
+    }
+
+    // TOTP replay guard advances regardless of account version
+    if ((acc.totpLastCounter || 0) > (user.totp_last_counter || 0)) {
+      await db.run("UPDATE users SET totp_last_counter = ? WHERE id = ?", [acc.totpLastCounter, user.id]);
+    }
+
+    // Tombstones first: a delete beats older edits, a newer edit beats the delete
+    for (const t of data.tombstones || []) {
+      const local = await db.get("SELECT id, modified_at FROM credentials WHERE id = ? AND user_id = ?", [t.id, user.id]);
+      if (!local || local.modified_at < t.deletedAt) {
+        if (local) {
+          await db.run("DELETE FROM credentials WHERE id = ? AND user_id = ?", [t.id, user.id]);
+          stats.credsDeleted++;
+        }
+        await db.run("INSERT OR REPLACE INTO tombstones (id, user_id, deleted_at) VALUES (?, ?, ?)", [t.id, user.id, t.deletedAt]);
+      }
+    }
+
+    // Credentials: last-write-wins by modifiedAt, respecting newer tombstones
+    for (const c of data.credentials || []) {
+      const tomb = await db.get("SELECT deleted_at FROM tombstones WHERE id = ? AND user_id = ?", [c.id, user.id]);
+      if (tomb && tomb.deleted_at >= c.modifiedAt) continue;
+
+      const local = await db.get("SELECT id, modified_at FROM credentials WHERE id = ? AND user_id = ?", [c.id, user.id]);
+      if (local && local.modified_at >= c.modifiedAt) continue;
+
+      await db.run(
+        `INSERT OR REPLACE INTO credentials (id, user_id, title_enc, username_enc, password_enc, url_enc, notes_enc, category_enc, iv, modified_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          c.id,
+          user.id,
+          dbEncrypt(c.title),
+          dbEncrypt(c.usernameEnc || ""),
+          dbEncrypt(c.passwordEnc || ""),
+          dbEncrypt(c.urlEnc || ""),
+          dbEncrypt(c.notesEnc || ""),
+          dbEncrypt(c.category || "General"),
+          dbEncrypt(c.iv),
+          c.modifiedAt,
+        ]
+      );
+      // Entry resurrected/updated: clear any older tombstone
+      await db.run("DELETE FROM tombstones WHERE id = ? AND user_id = ? AND deleted_at < ?", [c.id, user.id, c.modifiedAt]);
+      stats.credsApplied++;
+    }
+
+    // Passkeys: additive union by credential id; counters advance to max
+    const localPasskeys = await db.all("SELECT id, cred_id, counter FROM webauthn_credentials WHERE user_id = ?", [user.id]);
+    const localById = new Map(localPasskeys.map((p) => [dbDecrypt(p.cred_id), p]));
+    for (const pk of data.webauthn || []) {
+      const existing = localById.get(pk.credId);
+      if (existing) {
+        if ((pk.counter || 0) > (existing.counter || 0)) {
+          await db.run("UPDATE webauthn_credentials SET counter = ? WHERE id = ?", [pk.counter, existing.id]);
+        }
+      } else {
+        await db.run(
+          `INSERT INTO webauthn_credentials (user_id, cred_id, pubkey, counter, transports, label, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [user.id, dbEncrypt(pk.credId), dbEncrypt(pk.pubkey), pk.counter || 0, dbEncrypt(pk.transports), dbEncrypt(pk.label), pk.createdAt || Date.now()]
+        );
+        stats.passkeysAdded++;
+      }
+    }
+
+    return { stats, userId: user.id };
+  }
+
+  // Joiner-side: run one full exchange with the hub
+  async function runSyncExchange(): Promise<{ ok: boolean; detail: string }> {
+    const cfg = await getSyncConfig();
+    if (!cfg || cfg.role !== "joiner" || !cfg.peer_url) {
+      return { ok: false, detail: "Sync is not configured on this server (joiner role required)." };
+    }
+    const secretHex = dbDecrypt(cfg.secret_enc);
+
+    try {
+      const localUser = await db.get("SELECT id FROM users WHERE username_hash = ?", [cfg.username_hash]);
+      const localNow = Date.now();
+      const outbound = localUser ? await gatherSyncData(localUser.id, cfg.push_since || 0) : null;
+
+      const requestPayload = {
+        ts: Date.now(),
+        usernameHash: cfg.username_hash,
+        since: cfg.pull_since || 0,
+        data: outbound,
+      };
+
+      const response = await fetch(`${cfg.peer_url.replace(/\/$/, "")}/api/sync/exchange`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(syncSeal(requestPayload, secretHex)),
+      });
+      if (!response.ok) throw new Error(`Peer responded ${response.status}`);
+
+      const sealed = await response.json();
+      const inbound = syncOpen(sealed, secretHex);
+      if (!inbound) throw new Error("Peer response could not be authenticated.");
+
+      const { stats } = await applySyncData(inbound.data, true);
+
+      await db.run(
+        "UPDATE sync_config SET pull_since = ?, push_since = ?, last_sync_at = ?, last_sync_error = NULL WHERE id = 1",
+        [inbound.now, localNow, Date.now()]
+      );
+
+      const changed = stats.credsApplied + stats.credsDeleted + stats.passkeysAdded;
+      if ((changed > 0 || stats.accountUpdated) && localUser) {
+        await serverAudit(localUser.id, "sync_applied", `Sync: ${stats.credsApplied} updated, ${stats.credsDeleted} deleted, ${stats.passkeysAdded} passkeys added`);
+      }
+      return { ok: true, detail: `Applied ${stats.credsApplied} update(s), ${stats.credsDeleted} deletion(s).` };
+    } catch (err: any) {
+      const detail = err?.message || "Sync failed.";
+      await db.run("UPDATE sync_config SET last_sync_error = ? WHERE id = 1", [detail]).catch(() => {});
+      return { ok: false, detail };
+    }
+  }
+
+  // Hub-side: generate (or rotate) the pairing secret
+  app.post("/api/sync/pairing-code", authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = await db.get("SELECT username_hash FROM users WHERE id = ?", [req.userId]);
+      const secretHex = crypto.randomBytes(32).toString("hex");
+      await db.run(
+        `INSERT INTO sync_config (id, role, peer_url, username_hash, secret_enc)
+         VALUES (1, 'hub', NULL, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET role='hub', username_hash=excluded.username_hash, secret_enc=excluded.secret_enc`,
+        [user.username_hash, dbEncrypt(secretHex)]
+      );
+      await serverAudit(req.userId!, "sync_pairing", "Sync pairing secret generated (hub role)");
+      res.json({ secret: secretHex });
+    } catch (error) {
+      console.error("Pairing code error:", error);
+      res.status(500).json({ error: "Failed to generate pairing secret." });
+    }
+  });
+
+  // Hub-side: serve an exchange (merge joiner's changes, return ours)
+  app.post("/api/sync/exchange", async (req: Request, res: Response) => {
+    try {
+      const cfg = await getSyncConfig();
+      if (!cfg || cfg.role !== "hub") {
+        res.status(404).json({ error: "Sync is not enabled on this server." });
+        return;
+      }
+      const secretHex = dbDecrypt(cfg.secret_enc);
+      const payload = syncOpen(req.body, secretHex);
+      if (!payload || payload.usernameHash !== cfg.username_hash) {
+        res.status(401).json({ error: "Sync request could not be authenticated." });
+        return;
+      }
+
+      // Merge the joiner's outbound changes (if it has local state yet)
+      if (payload.data) {
+        await applySyncData(payload.data, false);
+      }
+
+      // Reply with our state since the joiner's watermark
+      const user = await db.get("SELECT id FROM users WHERE username_hash = ?", [cfg.username_hash]);
+      const now = Date.now();
+      const data = await gatherSyncData(user.id, payload.since || 0);
+      res.json(syncSeal({ ts: Date.now(), now, data }, secretHex));
+    } catch (error) {
+      console.error("Sync exchange error:", error);
+      res.status(500).json({ error: "Sync exchange failed." });
+    }
+  });
+
+  // Joiner-side: pair with a hub and import the account (bootstrap).
+  // Open only while this server has no accounts; afterwards requires auth.
+  app.post("/api/sync/join", authLimiter, async (req: Request, res: Response) => {
+    try {
+      const { peerUrl, secret, username } = req.body;
+      if (!peerUrl || !secret || !username) {
+        res.status(400).json({ error: "Peer URL, pairing secret, and username are required." });
+        return;
+      }
+
+      const userCount = await db.get("SELECT COUNT(*) as n FROM users");
+      if ((userCount?.n || 0) > 0) {
+        res.status(403).json({ error: "This server already has accounts. Joining is only allowed on a fresh server." });
+        return;
+      }
+
+      const usernameHash = usernameHashOf(String(username));
+      await db.run(
+        `INSERT INTO sync_config (id, role, peer_url, username_hash, secret_enc, pull_since, push_since)
+         VALUES (1, 'joiner', ?, ?, ?, 0, 0)
+         ON CONFLICT(id) DO UPDATE SET role='joiner', peer_url=excluded.peer_url, username_hash=excluded.username_hash, secret_enc=excluded.secret_enc, pull_since=0, push_since=0`,
+        [String(peerUrl), usernameHash, dbEncrypt(String(secret))]
+      );
+
+      const result = await runSyncExchange();
+      if (!result.ok) {
+        await db.run("DELETE FROM sync_config WHERE id = 1");
+        res.status(502).json({ error: `Could not reach or authenticate with the hub: ${result.detail}` });
+        return;
+      }
+
+      res.json({ success: true, message: "Vault imported. Log in with your master password.", detail: result.detail });
+    } catch (error) {
+      console.error("Sync join error:", error);
+      res.status(500).json({ error: "Failed to join sync." });
+    }
+  });
+
+  // Manual sync trigger + status (any logged-in user)
+  app.post("/api/sync/now", authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
+    const result = await runSyncExchange();
+    res.status(result.ok ? 200 : 502).json(result);
+  });
+
+  app.get("/api/sync/status", authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
+    const cfg = await getSyncConfig();
+    res.json(
+      cfg
+        ? {
+            role: cfg.role,
+            peerUrl: cfg.peer_url,
+            lastSyncAt: cfg.last_sync_at || 0,
+            lastSyncError: cfg.last_sync_error || null,
+          }
+        : { role: "none" }
+    );
+  });
+
+  // Periodic exchange on the joiner
+  setInterval(async () => {
+    const cfg = await getSyncConfig().catch(() => null);
+    if (cfg?.role === "joiner" && cfg.peer_url) {
+      await runSyncExchange();
+    }
+  }, SYNC_INTERVAL_MS).unref?.();
+
+  // Prune old tombstones (older than 90 days)
+  await db.run("DELETE FROM tombstones WHERE deleted_at < ?", [Date.now() - 90 * 24 * 60 * 60 * 1000]).catch(() => {});
 
   // -------------------------------------------------------------------------
   // Automated encrypted backups (daily). Snapshot via VACUUM INTO, then

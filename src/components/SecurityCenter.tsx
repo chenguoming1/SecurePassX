@@ -9,7 +9,7 @@
 import React, { useState, useEffect } from "react";
 import QRCode from "qrcode";
 import { motion, AnimatePresence } from "motion/react";
-import { Fingerprint, KeyRound, ShieldCheck, Smartphone, Trash2, Loader2, Plus, X } from "lucide-react";
+import { Fingerprint, KeyRound, ShieldCheck, Smartphone, Trash2, Loader2, Plus, X, RefreshCw, Laptop } from "lucide-react";
 import {
   deriveUserKeys,
   deriveKeyFromPrfSecret,
@@ -85,6 +85,15 @@ export default function SecurityCenter({
   const [pwNew, setPwNew] = useState("");
   const [pwConfirm, setPwConfirm] = useState("");
 
+  // Device sync
+  const [syncStatus, setSyncStatus] = useState<{
+    role: "hub" | "joiner" | "none";
+    peerUrl?: string | null;
+    lastSyncAt?: number;
+    lastSyncError?: string | null;
+  }>({ role: "none" });
+  const [pairingSecret, setPairingSecret] = useState<string | null>(null);
+
   const authedFetch = (url: string, options: RequestInit = {}) =>
     fetch(url, {
       ...options,
@@ -97,9 +106,10 @@ export default function SecurityCenter({
 
   const refreshState = async () => {
     try {
-      const [pkRes, totpRes] = await Promise.all([
+      const [pkRes, totpRes, syncRes] = await Promise.all([
         authedFetch("/api/auth/webauthn/credentials"),
         authedFetch("/api/auth/totp/status"),
+        authedFetch("/api/sync/status"),
       ]);
       if (pkRes.ok) {
         const list = await pkRes.json();
@@ -110,8 +120,52 @@ export default function SecurityCenter({
         const s = await totpRes.json();
         setTotpEnabled(!!s.enabled);
       }
+      if (syncRes.ok) {
+        setSyncStatus(await syncRes.json());
+      }
     } catch {
       /* non-fatal */
+    }
+  };
+
+  // ------------------------------------------------------------------
+  // Device sync
+  // ------------------------------------------------------------------
+  const handleGeneratePairing = async () => {
+    if (
+      syncStatus.role === "hub" &&
+      !confirm("Rotating the pairing secret disconnects devices paired with the old one. Continue?")
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const res = await authedFetch("/api/sync/pairing-code", { method: "POST", body: "{}" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to generate pairing secret.");
+      setPairingSecret(data.secret);
+      await refreshState();
+    } catch (err: any) {
+      setError(err.message || "Failed to generate pairing secret.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleSyncNow = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const res = await authedFetch("/api/sync/now", { method: "POST", body: "{}" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Sync failed.");
+      setNotice(`Sync complete. ${data.detail || ""}`);
+      await refreshState();
+    } catch (err: any) {
+      setError(err.message || "Sync failed.");
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -590,6 +644,77 @@ export default function SecurityCenter({
                 </button>
               </div>
             </form>
+          )}
+        </section>
+
+        {/* ------------------------------------------------ Device sync */}
+        <section className="mb-6 border-t border-slate-800 pt-4">
+          <h4 className="text-xs font-mono font-bold uppercase tracking-wider text-slate-400 mb-2 flex items-center gap-1.5">
+            <Laptop className="w-4 h-4 text-sky-400" />
+            Device Sync
+            <span
+              className={`ml-auto text-[9px] font-bold uppercase px-2 py-0.5 rounded-full ${
+                syncStatus.role !== "none"
+                  ? "bg-sky-500/10 border border-sky-500/20 text-sky-400"
+                  : "bg-slate-950 border border-slate-800 text-slate-500"
+              }`}
+            >
+              {syncStatus.role === "hub" ? "Hub" : syncStatus.role === "joiner" ? "Paired" : "Off"}
+            </span>
+          </h4>
+
+          {syncStatus.role === "joiner" ? (
+            <div className="space-y-2">
+              <div className="bg-[#020617] border border-slate-800 rounded-xl px-3 py-2 text-xs">
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Hub</span>
+                  <span className="text-slate-300 font-mono truncate ml-2">{syncStatus.peerUrl}</span>
+                </div>
+                <div className="flex justify-between mt-1">
+                  <span className="text-slate-500">Last sync</span>
+                  <span className="text-slate-300">
+                    {syncStatus.lastSyncAt ? new Date(syncStatus.lastSyncAt).toLocaleString() : "never"}
+                  </span>
+                </div>
+                {syncStatus.lastSyncError && (
+                  <div className="mt-1 text-rose-400 text-[10px]">Last error: {syncStatus.lastSyncError}</div>
+                )}
+              </div>
+              <button
+                onClick={handleSyncNow}
+                disabled={busy}
+                className="w-full py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl text-xs font-semibold text-slate-200 flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 text-sky-400 ${busy ? "animate-spin" : ""}`} />
+                Sync Now
+              </button>
+              <p className="text-[10px] text-slate-500">Also syncs automatically every 5 minutes while running.</p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <p className="text-[11px] text-slate-500">
+                Make this server the sync hub. On the second laptop's login screen, choose "Join synced vault" and
+                enter this server's URL plus the pairing secret.
+              </p>
+              {pairingSecret ? (
+                <>
+                  <div className="bg-[#020617] border border-slate-800 rounded-xl p-3 font-mono text-[11px] text-sky-300 break-all select-all">
+                    {pairingSecret}
+                  </div>
+                  <p className="text-[10px] text-amber-400">
+                    Copy it now - it is shown only once. This server's URL: {window.location.origin}
+                  </p>
+                </>
+              ) : (
+                <button
+                  onClick={handleGeneratePairing}
+                  disabled={busy}
+                  className="w-full py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl text-xs font-semibold text-slate-200 cursor-pointer disabled:opacity-50"
+                >
+                  {syncStatus.role === "hub" ? "Rotate pairing secret" : "Generate pairing secret"}
+                </button>
+              )}
+            </div>
           )}
         </section>
 

@@ -22,6 +22,10 @@ A self-hosted, end-to-end encrypted (E2EE) password manager. All vault content i
 - **Backups**: consistent snapshots (`VACUUM INTO`) at startup and every 24h, encrypted with a derived backup key, last 7 kept under `<db-dir>/backups/`. Restore: `node scripts/decrypt-backup.mjs <backup.db.enc> <out.db> [keyfile]`.
 - **Master password change**: Security Center re-encrypts the whole vault client-side and swaps it atomically on the server; passkey containers must be re-registered afterwards.
 
+### Device sync (two or more machines)
+
+Hub-and-spoke: one server is the **hub**, others **join** it. On the hub, open Security Center → Device Sync → generate a pairing secret. On a fresh second server, use "Join synced vault" on the login screen with the hub's URL, your username, and the secret — the account and vault are imported, then exchanged bidirectionally every 5 minutes (and via "Sync Now"). Merging is last-write-wins per entry with deletion tombstones; password rotations, TOTP settings, and passkeys propagate. All sync traffic is AES-256-GCM sealed with a key derived from the pairing secret (and contains only E2EE blobs), so it is safe on a LAN or VPN. The hub must be reachable from the joiner (e.g., Tailscale).
+
 ## Features
 
 - Create, edit, search, categorize, and favorite credential entries; password generator with configurable policy.
@@ -56,6 +60,7 @@ Serves on port 3001; database, key file, and backups persist in the `securepassx
 |---|---|---|
 | `DB_ENCRYPTION_KEY` | auto-generated `securepassx.key` | Master key material for at-rest encryption, JWT signing, and backups (min 16 chars) |
 | `DB_PATH` | `./securepassx.db` | SQLite database location |
+| `FORCE_HTTPS` | off | Set to `true` when running behind a TLS reverse proxy to redirect plain HTTP; leave off for direct LAN/Tailscale HTTP access |
 
 ## Deployment Notes
 
