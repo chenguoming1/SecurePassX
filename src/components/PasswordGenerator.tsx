@@ -21,6 +21,18 @@ interface PasswordGeneratorProps {
   inline?: boolean;
 }
 
+// Cryptographically secure uniform integer in [0, max) via rejection sampling
+function secureRandomInt(max: number): number {
+  const limit = Math.floor(0xffffffff / max) * max;
+  const buf = new Uint32Array(1);
+  let value: number;
+  do {
+    window.crypto.getRandomValues(buf);
+    value = buf[0];
+  } while (value >= limit);
+  return value % max;
+}
+
 export default function PasswordGenerator({ onUseGenerated, inline = false }: PasswordGeneratorProps) {
   const [password, setPassword] = useState("");
   const [copied, setCopied] = useState(false);
@@ -42,7 +54,7 @@ export default function PasswordGenerator({ onUseGenerated, inline = false }: Pa
     if (mode === "passphrase") {
       const selectedWords: string[] = [];
       for (let i = 0; i < wordCount; i++) {
-        const randomIndex = Math.floor(Math.random() * DICERE_WORDS.length);
+        const randomIndex = secureRandomInt(DICERE_WORDS.length);
         selectedWords.push(DICERE_WORDS[randomIndex]);
       }
       setPassword(selectedWords.join(separator));
@@ -76,20 +88,20 @@ export default function PasswordGenerator({ onUseGenerated, inline = false }: Pa
     let generated = "";
     // Guarantee at least one character of each selected pool for cryptographic safety
     const pools: string[] = [];
-    if (uppercase && uppers) pools.push(uppers[Math.floor(Math.random() * uppers.length)]);
-    if (lowercase && lowers) pools.push(lowers[Math.floor(Math.random() * lowers.length)]);
-    if (numbers && nums) pools.push(nums[Math.floor(Math.random() * nums.length)]);
-    if (specials && symbols) pools.push(symbols[Math.floor(Math.random() * symbols.length)]);
+    if (uppercase && uppers) pools.push(uppers[secureRandomInt(uppers.length)]);
+    if (lowercase && lowers) pools.push(lowers[secureRandomInt(lowers.length)]);
+    if (numbers && nums) pools.push(nums[secureRandomInt(nums.length)]);
+    if (specials && symbols) pools.push(symbols[secureRandomInt(symbols.length)]);
 
     for (let i = 0; i < length - pools.length; i++) {
-      const randomIndex = Math.floor(Math.random() * chars.length);
+      const randomIndex = secureRandomInt(chars.length);
       generated += chars[randomIndex];
     }
 
     // Blend and insert guaranteed characters
     const finalBuffer = (generated + pools.join("")).split("");
     for (let i = finalBuffer.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
+      const j = secureRandomInt(i + 1);
       [finalBuffer[i], finalBuffer[j]] = [finalBuffer[j], finalBuffer[i]];
     }
 
@@ -149,6 +161,7 @@ export default function PasswordGenerator({ onUseGenerated, inline = false }: Pa
         </h4>
         <div className="flex bg-slate-850 p-1 rounded-lg border border-slate-800">
           <button
+            type="button"
             onClick={() => setMode("standard")}
             className={`px-2.5 py-1 rounded-md font-mono text-[10px] uppercase font-semibold tracking-wider transition-colors ${
               mode === "standard" ? "bg-slate-705 text-slate-100 bg-slate-800" : "text-slate-400 hover:text-slate-200"
@@ -157,6 +170,7 @@ export default function PasswordGenerator({ onUseGenerated, inline = false }: Pa
             Symmetric Key
           </button>
           <button
+            type="button"
             onClick={() => setMode("passphrase")}
             className={`px-2.5 py-1 rounded-md font-mono text-[10px] uppercase font-semibold tracking-wider transition-colors ${
               mode === "passphrase" ? "bg-slate-705 text-slate-100 bg-slate-800" : "text-slate-400 hover:text-slate-200"
@@ -176,6 +190,7 @@ export default function PasswordGenerator({ onUseGenerated, inline = false }: Pa
         )}
         <div className="absolute right-2 flex gap-1">
           <button
+            type="button"
             onClick={generatePassword}
             id="btn-regen-password"
             title="Regenerate"
@@ -184,6 +199,7 @@ export default function PasswordGenerator({ onUseGenerated, inline = false }: Pa
             <RefreshCw className="w-4 h-4" />
           </button>
           <button
+            type="button"
             onClick={handleCopy}
             id="btn-copy-generated"
             title="Copy to Clipboard"
@@ -330,6 +346,7 @@ export default function PasswordGenerator({ onUseGenerated, inline = false }: Pa
 
       {onUseGenerated && password && (
         <button
+          type="button"
           onClick={() => onUseGenerated(password)}
           id="btn-use-generated"
           className="w-full mt-4 flex items-center justify-center gap-1 bg-teal-600 hover:bg-teal-500 active:bg-teal-700 text-white font-sans font-semibold text-xs py-2 rounded-lg transition-all shadow-md group cursor-pointer"

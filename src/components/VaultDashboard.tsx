@@ -1090,7 +1090,7 @@ export default function VaultDashboard({
                     initial={{ opacity: 0, scale: 0.95 }}
                     animate={{ opacity: 1, scale: 1 }}
                     exit={{ opacity: 0, scale: 0.95 }}
-                    className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-3xl p-6 relative text-left shadow-2xl"
+                    className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-3xl p-6 relative text-left shadow-2xl max-h-[90vh] overflow-y-auto scrollbar"
                 >
                   <div className="flex justify-between items-start border-b border-slate-800 pb-3 mb-4">
                     <div>
@@ -1252,7 +1252,7 @@ export default function VaultDashboard({
                     initial={{ opacity: 0, scale: 0.95 }}
                     animate={{ opacity: 1, scale: 1 }}
                     exit={{ opacity: 0, scale: 0.95 }}
-                    className="w-full max-w-lg bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl p-6 text-left text-slate-150"
+                    className="w-full max-w-lg bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl p-6 text-left text-slate-150 max-h-[90vh] overflow-y-auto scrollbar"
                 >
                   <div className="flex justify-between items-center border-b border-slate-800 pb-3 mb-4">
                     <h3 className="font-sans font-bold text-base text-white">
