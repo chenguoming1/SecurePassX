@@ -34,6 +34,10 @@ Hub-and-spoke: one server is the **hub**, others **join** it. On the hub, open S
 - Audit trail of vault actions and auth events (logins, failures, lockouts, passkey/2FA changes).
 - Auto-lock after 5 minutes of inactivity; copied secrets wiped from the clipboard after 30 seconds and on lock.
 
+### Browser extension (autofill)
+
+`extension/` contains a Chrome (Manifest V3) companion that fills login forms from your vault. Load it via chrome://extensions → enable Developer mode → "Load unpacked" → select the `extension` folder. Set your vault server URL, unlock with username + master password (+ 2FA code if enabled), and entries matching the active tab's domain appear with a Fill button. It is a zero-knowledge client: keys are derived locally, the session key lives in memory-only storage (cleared when the browser exits) with a 10-minute auto-lock, and filling only happens on click.
+
 ## Quick Start
 
 ### Local development

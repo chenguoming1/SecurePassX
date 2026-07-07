@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "SecurePassX Autofill",
+  "version": "1.0.0",
+  "description": "Autofill credentials from your self-hosted SecurePassX vault. Zero-knowledge: decryption happens locally.",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "SecurePassX"
+  },
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": ["<all_urls>"]
+}

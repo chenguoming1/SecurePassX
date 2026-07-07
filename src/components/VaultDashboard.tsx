@@ -1179,9 +1179,23 @@ export default function VaultDashboard({
                             <a
                                 href={selectedCred.url.startsWith("http") ? selectedCred.url : `https://${selectedCred.url}`}
                                 target="_blank"
-                                rel="noreferrer"
-                                className="text-slate-500 hover:text-slate-200 shrink-0 ml-2"
+                                rel="noreferrer noopener"
+                                onClick={() => {
+                                  // Browsers don't allow cross-site form filling from a web
+                                  // app, so we do the next best thing: put the password on
+                                  // the clipboard (auto-clears in 30s) as the site opens.
+                                  if (selectedCred.password) {
+                                    copyToClipboardSecurely(selectedCred.password);
+                                    setSuccessMessage(
+                                      `Password for '${selectedCred.title}' copied - paste it on the site. Clipboard clears in 30s.`
+                                    );
+                                    logAuditEntry("open_and_copy", selectedCred.title);
+                                  }
+                                }}
+                                title="Open site and copy password to clipboard"
+                                className="text-slate-500 hover:text-slate-200 shrink-0 ml-2 flex items-center gap-1"
                             >
+                                <span className="text-[9px] font-sans font-bold uppercase tracking-wide text-emerald-500">Open + Copy</span>
                                 <ExternalLink className="w-3.5 h-3.5" />
                             </a>
                           </div>

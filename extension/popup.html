@@ -1,0 +1,106 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 340px;
+      background: #020617;
+      color: #e2e8f0;
+      font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+      font-size: 13px;
+    }
+    .wrap { padding: 14px; }
+    h1 { font-size: 15px; font-weight: 700; margin-bottom: 2px; }
+    h1 .x { color: #10b981; }
+    .sub { font-size: 10px; color: #64748b; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 12px; }
+    .view { display: none; }
+    .view.active { display: block; }
+    label { display: block; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: #94a3b8; margin: 10px 0 4px; }
+    input {
+      width: 100%; background: #0f172a; border: 1px solid #1e293b; border-radius: 10px;
+      padding: 9px 11px; color: #f1f5f9; font-size: 12px; outline: none;
+    }
+    input:focus { border-color: #10b981; }
+    button {
+      width: 100%; margin-top: 12px; padding: 10px; border: none; border-radius: 10px;
+      background: #059669; color: #fff; font-weight: 700; font-size: 12px; cursor: pointer;
+    }
+    button:hover { background: #10b981; }
+    button.ghost { background: #1e293b; color: #cbd5e1; }
+    button.ghost:hover { background: #334155; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    .msg { margin-top: 10px; padding: 8px 10px; border-radius: 10px; font-size: 11px; display: none; }
+    .msg.err { display: block; background: rgba(244,63,94,0.1); border: 1px solid rgba(244,63,94,0.25); color: #fda4af; }
+    .msg.ok { display: block; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.25); color: #6ee7b7; }
+    .row { display: flex; gap: 8px; }
+    .row > * { flex: 1; }
+    .cred {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      background: #0f172a; border: 1px solid #1e293b; border-radius: 10px;
+      padding: 8px 10px; margin-top: 8px;
+    }
+    .cred .meta { min-width: 0; }
+    .cred .title { font-weight: 600; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .cred .user { font-size: 10px; color: #64748b; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: ui-monospace, monospace; }
+    .cred .fill {
+      width: auto; margin: 0; padding: 6px 12px; font-size: 11px; flex-shrink: 0;
+    }
+    .section { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; margin-top: 14px; }
+    .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    .topbar .actions { display: flex; gap: 6px; }
+    .topbar button { width: auto; margin: 0; padding: 5px 10px; font-size: 10px; }
+    .empty { color: #475569; font-size: 11px; margin-top: 10px; text-align: center; padding: 12px 0; }
+    #search { margin-top: 6px; }
+    a.settings-link { color: #38bdf8; font-size: 11px; display: inline-block; margin-top: 10px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>SecurePass<span class="x">X</span></h1>
+    <div class="sub">Autofill Companion</div>
+
+    <!-- Settings -->
+    <div id="view-settings" class="view">
+      <label>Vault Server URL</label>
+      <input id="server-url" type="url" placeholder="http://localhost:3000" />
+      <button id="btn-save-settings">Save</button>
+      <div id="msg-settings" class="msg"></div>
+    </div>
+
+    <!-- Login -->
+    <div id="view-login" class="view">
+      <label>Username</label>
+      <input id="login-username" type="text" autocomplete="off" />
+      <label>Master Password</label>
+      <input id="login-password" type="password" />
+      <div id="totp-box" style="display:none">
+        <label>2FA Code</label>
+        <input id="login-totp" type="text" inputmode="numeric" maxlength="6" placeholder="6-digit code" />
+      </div>
+      <button id="btn-login">Unlock Vault</button>
+      <a class="settings-link" id="link-settings">Server settings</a>
+      <div id="msg-login" class="msg"></div>
+    </div>
+
+    <!-- Vault -->
+    <div id="view-vault" class="view">
+      <div class="topbar">
+        <div class="sub" id="vault-domain" style="margin:0"></div>
+        <div class="actions">
+          <button class="ghost" id="btn-refresh">Refresh</button>
+          <button class="ghost" id="btn-lock">Lock</button>
+        </div>
+      </div>
+      <div id="matches"></div>
+      <div class="section">All entries</div>
+      <input id="search" type="text" placeholder="Search vault..." />
+      <div id="all-creds"></div>
+      <div id="msg-vault" class="msg"></div>
+    </div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
